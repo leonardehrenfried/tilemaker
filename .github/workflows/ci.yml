@@ -119,9 +119,6 @@ jobs:
         output: ${{ env.AREA }}.mbtiles
 
   dockerhub:
-    # we only want to push to dockerhub on the main repo
-    if: github.repository_owner == 'systemed' && github.event_name == 'push' && github.ref == 'refs/heads/master'
-
     name: Push container image to Dockerhub
 
     runs-on: ubuntu-latest
