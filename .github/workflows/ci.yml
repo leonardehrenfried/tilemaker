@@ -30,7 +30,7 @@ jobs:
 
     - name: Build tilemaker
       run: |
-        mkdir ${{ github.workspace }}\build        
+        mkdir ${{ github.workspace }}\build
         cd ${{ github.workspace }}\build && cmake -DTILEMAKER_BUILD_STATIC=ON -DVCPKG_TARGET_TRIPLET="x64-windows-static-md" -DCMAKE_TOOLCHAIN_FILE="c:\vcpkg\scripts\buildsystems\vcpkg.cmake"  ..
         cd ${{ github.workspace }}\build && cmake --build . --config RelWithDebInfo
 
@@ -48,9 +48,9 @@ jobs:
           ${{ github.workspace }}\build\RelWithDebInfo\tilemaker.exe
           ${{ github.workspace }}\build\RelWithDebInfo\*.pdb
 
-  unix-build:  
-    strategy:  
-      matrix: 
+  unix-build:
+    strategy:
+      matrix:
         include:
           - os: ubuntu-22.04
             triplet: x64-linux
@@ -82,10 +82,10 @@ jobs:
 
     - name: Build tilemaker
       run: |
-        mkdir build        
-        cd build        
+        mkdir build
+        cd build
         cmake -DTILEMAKER_BUILD_STATIC=ON -DCMAKE_BUILD_TYPE=Release -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} -DCMAKE_TOOLCHAIN_FILE=${{ matrix.toolchain }} -DCMAKE_CXX_COMPILER=g++ ..
-        cmake --build . 
+        cmake --build .
         strip tilemaker
 
     - name: Build openmaptiles-compatible mbtiles files of Liechtenstein
@@ -115,7 +115,7 @@ jobs:
     - name: Build openmaptiles-compatible mbtiles files of given area
       uses: ./
       with:
-        input: ${{ env.AREA }}.osm.pbf 
+        input: ${{ env.AREA }}.osm.pbf
         output: ${{ env.AREA }}.mbtiles
 
   docker-build:
@@ -144,6 +144,9 @@ jobs:
         uses: docker/metadata-action@98669ae865ea3cffbcbaa878cf57c20bbf1c6c38
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=schedule,pattern=latest
+            type=schedule,pattern={{date 'YYYY-MM-DDTHH_mm'}}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
