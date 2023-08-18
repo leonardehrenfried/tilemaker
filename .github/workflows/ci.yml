@@ -145,8 +145,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=schedule,pattern=latest
-            type=schedule,pattern={{date 'YYYY-MM-DDTHH_mm'}}
+            type=schedule,pattern=latest,type=branch
+            type=schedule,pattern={{date 'YYYY-MM-DDTHH_mm'}},type=branch
+            type=semver,type=pr
 
       - name: Build and push Docker image
         uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
