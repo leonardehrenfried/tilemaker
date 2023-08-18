@@ -374,10 +374,10 @@ jobs:
           ${{ github.workspace }}\build\RelWithDebInfo\tilemaker.exe
           ${{ github.workspace }}\build\RelWithDebInfo\*.pdb
 
-  unix-build:  
-    strategy:  
+  unix-build:
+    strategy:
       fail-fast: false
-      matrix: 
+      matrix:
         include:
           - os: ubuntu-22.04
             triplet: x64-linux
@@ -420,7 +420,7 @@ jobs:
         mkdir build
         cd build
         cmake -DTILEMAKER_BUILD_STATIC=ON -DCMAKE_BUILD_TYPE=Release -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DCMAKE_CXX_COMPILER=g++ ..
-        cmake --build . 
+        cmake --build .
         strip tilemaker
 
     - name: Build openmaptiles-compatible mbtiles files of Liechtenstein
@@ -762,6 +762,9 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=schedule,pattern=latest
+            type=schedule,pattern={{date 'YYYY-MM-DDTHH_mm'}}
 
       - name: Read tilemaker version
         id: version
