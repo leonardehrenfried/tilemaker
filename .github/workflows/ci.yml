@@ -680,6 +680,9 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=raw,value={{date 'YYYY-MM-DDTHH-mm'}}
+          type=raw,value=latest
 
       - name: Read tilemaker version
         id: version
