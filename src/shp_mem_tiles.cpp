@@ -1,11 +1,15 @@
 #include "shp_mem_tiles.h"
+#include "coordinates_geom.h"
 #include <iostream>
+#include <mutex>
+
 using namespace std;
 namespace geom = boost::geometry;
 extern bool verbose;
 
-ShpMemTiles::ShpMemTiles(OSMStore &osmStore, uint baseZoom)
-	: TileDataSource(baseZoom), osmStore(osmStore)
+ShpMemTiles::ShpMemTiles(size_t threadNum, uint indexZoom)
+	: TileDataSource(threadNum, indexZoom, false),
+	spatialIndexZoom(15)
 { }
 
 // Look for shapefile objects that fulfil a spatial query (e.g. intersects)
@@ -14,9 +18,13 @@ ShpMemTiles::ShpMemTiles(OSMStore &osmStore, uint baseZoom)
 // - bounding box to match against
 // - indexQuery(rtree, results) lambda, implements: rtree.query(geom::index::covered_by(box), back_inserter(results))
 // - checkQuery(osmstore, id) lambda, implements:   return geom::covered_by(osmStore.retrieve(id), geom)
-vector<uint> ShpMemTiles::QueryMatchingGeometries(const string &layerName, bool once, Box &box, 
-	function<vector<IndexValue>(const RTree &rtree)> indexQuery, 
-	function<bool(OutputObject const &oo)> checkQuery) const {
+vector<uint> ShpMemTiles::QueryMatchingGeometries(
+	const string& layerName,
+	bool once,
+	Box& box,
+	function<vector<IndexValue>(const RTree &rtree)> indexQuery,
+	function<bool(const OutputObject& oo)> checkQuery
+) const {
 	
 	// Find the layer
 	auto f = indices.find(layerName); // f is an RTree
@@ -32,131 +40,189 @@ vector<uint> ShpMemTiles::QueryMatchingGeometries(const string &layerName, bool 
 	vector<uint> ids;
 	for (auto it: results) {
 		uint id = it.second;
-		if (checkQuery(*cachedGeometries.at(id))) { ids.push_back(id); if (once) break; }
+		if (checkQuery(indexedGeometries.at(id))) { ids.push_back(id); if (once) break; }
 	}
 	return ids;
 }
 
-vector<string> ShpMemTiles::namesOfGeometries(const vector<uint> &ids) const {
+vector<string> ShpMemTiles::namesOfGeometries(const vector<uint>& ids) const {
 	vector<string> names;
 	for (uint i=0; i<ids.size(); i++) {
-		if (cachedGeometryNames.find(ids[i])!=cachedGeometryNames.end()) {
-			names.push_back(cachedGeometryNames.at(ids[i]));
+		if (indexedGeometryNames.find(ids[i])!=indexedGeometryNames.end()) {
+			names.push_back(indexedGeometryNames.at(ids[i]));
 		}
 	}
 	return names;
 }
 
-void ShpMemTiles::CreateNamedLayerIndex(const std::string &layerName) {
+void ShpMemTiles::CreateNamedLayerIndex(const std::string& layerName) {
 	indices[layerName]=RTree();
+
+	bitIndices[layerName] = std::vector<std::vector<bool>>();
+	bitIndices[layerName].resize((1u << CLUSTER_ZOOM) * (1u << CLUSTER_ZOOM));
 }
 
-OutputObjectRef ShpMemTiles::StoreShapefileGeometry(uint_least8_t layerNum,
-	const std::string &layerName, enum OutputGeometryType geomType,
-	Geometry geometry, bool isIndexed, bool hasName, const std::string &name, AttributeStoreRef attributes, uint minzoom) {
+bool ShpMemTiles::mayIntersect(const std::string& layerName, const Box& box) const {
+	// Check if any tiles in the bitmap might intersect this shape.
+	// If none, downstream code can skip querying the r-tree.
+	auto& sparseLayerVector = bitIndices.at(layerName);
+
+	double lon1 = box.min_corner().x();
+	double latp1 = box.min_corner().y();
+	double lon2 = box.max_corner().x();
+	double latp2 = box.max_corner().y();
+
+	uint32_t x1 = lon2tilex(lon1, spatialIndexZoom);
+	uint32_t x2 = lon2tilex(lon2, spatialIndexZoom);
+	uint32_t y1 = latp2tiley(latp1, spatialIndexZoom);
+	uint32_t y2 = latp2tiley(latp2, spatialIndexZoom);
+
+	for (int x = std::min(x1, x2); x <= std::min((1u << spatialIndexZoom) - 1u, std::max(x1, x2)); x++) {
+		for (int y = std::min(y1, y2); y <= std::min((1u << spatialIndexZoom) - 1u, std::max(y1, y2)); y++) {
+			uint32_t z6x = x / (1u << (spatialIndexZoom - CLUSTER_ZOOM));
+			uint32_t z6y = y / (1u << (spatialIndexZoom - CLUSTER_ZOOM));
+
+			auto& bitvec = sparseLayerVector[z6x * CLUSTER_ZOOM + z6y];
+
+			uint32_t divisor = 1u << (spatialIndexZoom - CLUSTER_ZOOM);
+			uint64_t index = 2u * ((x - z6x * divisor) * divisor + (y - z6y * divisor));
+
+			if (!bitvec.empty() && bitvec[index]) {
+				if (bitvec[index + 1])
+					return true;
+				else {
+					// When we loaded the shapefiles, we did a rough index based on a bounding
+					// box. For large, irregularly shaped polygons like national forests, this
+					// can give false positives.
+					//
+					// We lazily do a more exacting check here, intersecting the index zoom tile.
+					// Afterwards, we eitehr set bitvec[index + 1] or clear bitvec[index].
+					TileBbox bbox(TileCoordinates(x, y), spatialIndexZoom, false, false);
+					std::vector<uint> intersections = QueryMatchingGeometries(
+						layerName,
+						true,
+						bbox.clippingBox,
+						[&](const RTree &rtree) { // indexQuery
+							vector<IndexValue> results;
+							rtree.query(geom::index::intersects(bbox.clippingBox), back_inserter(results));
+							return results;
+						},
+						[&](OutputObject const &oo) { // checkQuery
+							return geom::intersects(bbox.clippingBox, retrieveMultiPolygon(oo.objectID));
+						}
+					);
+
+					if (intersections.empty()) {
+						bitvec[index] = false;
+					} else {
+						bitvec[index + 1] = true;
+						return true;
+					}
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
+void ShpMemTiles::StoreGeometry(
+	uint_least8_t layerNum,
+	const std::string& layerName,
+	enum OutputGeometryType geomType,
+	Geometry geometry,
+	bool isIndexed,
+	bool hasName,
+	const std::string& name, 
+	uint minzoom,
+	AttributeIndex attrIdx
+) {
 
 	geom::model::box<Point> box;
 	geom::envelope(geometry, box);
 
-	uint id = cachedGeometries.size();
-	if (isIndexed) {
-		indices.at(layerName).insert(std::make_pair(box, id));
-		if (hasName) cachedGeometryNames[id]=name;
-	}
-
-	OutputObjectRef oo;
-
 	uint tilex = 0, tiley = 0;
+	std::shared_ptr<OutputObject> oo;
 	switch(geomType) {
 		case POINT_:
 		{
-			Point *p = boost::get<Point>(&geometry);
+			Point* p = boost::get<Point>(&geometry);
 			if (p != nullptr) {
-	
 				Point sp(p->x()*10000000.0, p->y()*10000000.0);
-				osmStore.store_point(osmStore.shp(), id, sp);
-				oo = CreateObject(OutputObjectOsmStorePoint(
-					geomType, layerNum, id, attributes, minzoom));
-				cachedGeometries.push_back(oo);
-
-				tilex =  lon2tilex(p->x(), baseZoom);
-				tiley = latp2tiley(p->y(), baseZoom);
-				AddObject(TileCoordinates(tilex, tiley), oo);
-			}
+				NodeID oid = storePoint(sp);
+				oo = std::make_shared<OutputObject>(geomType, layerNum, oid, attrIdx, minzoom);
+				tilex =  lon2tilex(p->x(), indexZoom);
+				tiley = latp2tiley(p->y(), indexZoom);
+				addObjectToSmallIndex(TileCoordinates(tilex, tiley), *oo, 0);
+			} else { return; }
 		} break;
 
 		case LINESTRING_:
 		{
-			osmStore.store_linestring(osmStore.shp(), id, boost::get<Linestring>(geometry));
-			oo = CreateObject(OutputObjectOsmStoreLinestring(
-						geomType, layerNum, id, attributes, minzoom));
-			cachedGeometries.push_back(oo);
+			NodeID oid = storeLinestring(boost::get<Linestring>(geometry));
+			oo = std::make_shared<OutputObject>(geomType, layerNum, oid, attrIdx, minzoom);
+			std::vector<OutputObject> oolist { *oo };
+			addGeometryToIndex(boost::get<Linestring>(geometry), oolist, 0);
 
-			addToTileIndexPolyline(oo, &geometry);
 		} break;
 
 		case POLYGON_:
 		{
-			osmStore.store_multi_polygon(osmStore.shp(), id, boost::get<MultiPolygon>(geometry));
-			oo = CreateObject(OutputObjectOsmStoreMultiPolygon(
-						geomType, layerNum, id, attributes, minzoom));
-			cachedGeometries.push_back(oo);
-			
-			// add to tile index
-			addToTileIndexByBbox(oo, 
-				box.min_corner().get<0>(), box.min_corner().get<1>(), 
-				box.max_corner().get<0>(), box.max_corner().get<1>());
+			NodeID oid = storeMultiPolygon(boost::get<MultiPolygon>(geometry));
+			oo = std::make_shared<OutputObject>(geomType, layerNum, oid, attrIdx, minzoom);
+			std::vector<OutputObject> oolist { *oo };
+			addGeometryToIndex(boost::get<MultiPolygon>(geometry), oolist, 0);
+
+		} break;
+
+		case MULTILINESTRING_:
+		{
+			NodeID oid = storeMultiLinestring(boost::get<MultiLinestring>(geometry));
+			oo = std::make_shared<OutputObject>(geomType, layerNum, oid, attrIdx, minzoom);
+			std::vector<OutputObject> oolist { *oo };
+			addGeometryToIndex(boost::get<MultiLinestring>(geometry), oolist, 0);
+
 		} break;
 
 		default:
-			break;
+			throw std::runtime_error("Unknown geometry type");
 	}
 
-	return oo;
-}
+	// Add to index
+	if (!isIndexed) return;
+	std::lock_guard<std::mutex> indexLock(indexMutex);
+	uint id = indexedGeometries.size();
+	indices.at(layerName).insert(std::make_pair(box, id));
+	if (hasName) { indexedGeometryNames[id] = name; }
+	indexedGeometries.push_back(*oo);
 
-// Add an OutputObject to all tiles between min/max lat/lon
-// (only used for polygons)
-void ShpMemTiles::addToTileIndexByBbox(OutputObjectRef &oo, double minLon, double minLatp, double maxLon, double maxLatp) {
-	uint minTileX =  lon2tilex(minLon, baseZoom);
-	uint maxTileX =  lon2tilex(maxLon, baseZoom);
-	uint minTileY = latp2tiley(minLatp, baseZoom);
-	uint maxTileY = latp2tiley(maxLatp, baseZoom);
-	uint size = (maxTileX - minTileX + 1) * (minTileY - maxTileY + 1);
-	if (size>=16) { 
-		// Larger objects - add to rtree
-		AddObjectToLargeIndex(Box(Point(minTileX, maxTileY), Point(maxTileX, minTileY)), oo);
-	} else {
-		// Smaller objects - add to each individual tile index
-		for (uint x=min(minTileX,maxTileX); x<=max(minTileX,maxTileX); x++) {
-			for (uint y=min(minTileY,maxTileY); y<=max(minTileY,maxTileY); y++) {
-				TileCoordinates index(x, y);
-				AddObject(index, oo);
-			}
+	// Store a bitmap of which tiles at the spatialIndexZoom that might intersect
+	// this shape.
+	auto& sparseLayerVector = bitIndices.at(layerName);
+	double lon1 = box.min_corner().x();
+	double latp1 = box.min_corner().y();
+	double lon2 = box.max_corner().x();
+	double latp2 = box.max_corner().y();
+
+	uint32_t x1 = lon2tilex(lon1, spatialIndexZoom);
+	uint32_t x2 = lon2tilex(lon2, spatialIndexZoom);
+	uint32_t y1 = latp2tiley(latp1, spatialIndexZoom);
+	uint32_t y2 = latp2tiley(latp2, spatialIndexZoom);
+
+	for (int x = std::min(x1, x2); x <= std::min((1u << spatialIndexZoom) - 1u, std::max(x1, x2)); x++) {
+		for (int y = std::min(y1, y2); y <= std::min((1u << spatialIndexZoom) - 1u, std::max(y1, y2)); y++) {
+			uint32_t z6x = x / (1u << (spatialIndexZoom - CLUSTER_ZOOM));
+			uint32_t z6y = y / (1u << (spatialIndexZoom - CLUSTER_ZOOM));
+
+			uint32_t sparseIndex = z6x * CLUSTER_ZOOM + z6y;
+			auto& bitvec = sparseLayerVector[sparseIndex];
+
+			if (bitvec.empty())
+				bitvec.resize(2u * (1u << (spatialIndexZoom - CLUSTER_ZOOM)) * (1u << (spatialIndexZoom - CLUSTER_ZOOM)));
+
+			uint32_t divisor = 1u << (spatialIndexZoom - CLUSTER_ZOOM);
+			uint64_t index = 2u * ((x - z6x * divisor) * divisor + (y - z6y * divisor));
+			bitvec[index] = true;
 		}
 	}
 }
-
-// Add an OutputObject to all tiles along a polyline
-void ShpMemTiles::addToTileIndexPolyline(OutputObjectRef &oo, Geometry *geom) {
-
-	const Linestring *ls = boost::get<Linestring>(geom);
-	if(ls == nullptr) return;
-	uint lastx = UINT_MAX;
-	uint lasty;
-	for (Linestring::const_iterator jt = ls->begin(); jt != ls->end(); ++jt) {
-		uint tilex =  lon2tilex(jt->get<0>(), baseZoom);
-		uint tiley = latp2tiley(jt->get<1>(), baseZoom);
-		if (lastx==UINT_MAX) {
-			AddObject(TileCoordinates(tilex, tiley), oo);
-		} else if (lastx!=tilex || lasty!=tiley) {
-			for (uint x=min(tilex,lastx); x<=max(tilex,lastx); x++) {
-				for (uint y=min(tiley,lasty); y<=max(tiley,lasty); y++) {
-					AddObject(TileCoordinates(x, y), oo);
-				}
-			}
-		}
-		lastx=tilex; lasty=tiley;
-	}
-}
-

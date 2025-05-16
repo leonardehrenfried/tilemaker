@@ -10,7 +10,7 @@ using uint = unsigned int;
 #include <limits>
 
 // boost::geometry
-#define BOOST_GEOMETRY_INCLUDE_SELF_TURNS
+#define BOOST_GEOMETRY_NO_ROBUSTNESS
 #include <boost/geometry.hpp>
 #include <boost/geometry/algorithms/intersection.hpp>
 #include <boost/geometry/geometries/geometries.hpp>
@@ -24,13 +24,6 @@ using uint = unsigned int;
 
 #include <boost/interprocess/managed_external_buffer.hpp>
 #include <boost/interprocess/allocators/node_allocator.hpp>
-
-#define OSMID_TYPE_OFFSET 40
-#define OSMID_MASK      ((1L<<OSMID_TYPE_OFFSET)-1)
-#define OSMID_SHAPE     (0L<<OSMID_TYPE_OFFSET)
-#define OSMID_NODE      (1L<<OSMID_TYPE_OFFSET)
-#define OSMID_WAY       (2L<<OSMID_TYPE_OFFSET)
-#define OSMID_RELATION  (3L<<OSMID_TYPE_OFFSET)
 
 namespace bi = boost::interprocess;
 
@@ -46,11 +39,6 @@ typedef boost::geometry::interior_type<Polygon>::type InteriorRing;
 typedef boost::variant<Point,Linestring,MultiLinestring,MultiPolygon> Geometry;
 typedef std::pair<Box, uint> IndexValue;
 typedef boost::geometry::index::rtree< IndexValue, boost::geometry::index::quadratic<16> > RTree;
-
-typedef uint64_t NodeID;
-typedef uint64_t WayID;
-
-typedef std::vector<WayID> WayVec;
 
 // Perform self-intersection aware simplification of geometry types
 Linestring simplify(Linestring const &ls, double max_distance);
@@ -88,6 +76,8 @@ template<class GeometryT>
 void make_valid(GeometryT &geom) { }
 
 void make_valid(MultiPolygon &mp);
+
+void union_many(std::vector<MultiPolygon> &mps);
 
 Point intersect_edge(Point const &a, Point const &b, char edge, Box const &bbox);
 char bit_code(Point const &p, Box const &bbox);

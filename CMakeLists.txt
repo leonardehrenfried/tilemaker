@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.0)
+cmake_minimum_required(VERSION 3.18)
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE "Release")
@@ -18,9 +18,6 @@ if (POLICY CMP0074)
   cmake_policy(SET CMP0074 NEW)
 endif()
 
-include_directories(include)
-include_directories(${CMAKE_BINARY_DIR}) # for generated files
-
 IF (TILEMAKER_BUILD_STATIC)
     MESSAGE (STATUS "Staticly linking with Boost")
     SET (Boost_USE_STATIC_LIBS TRUE)
@@ -34,17 +31,11 @@ IF ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
     LINK_DIRECTORIES(${Boost_LIBRARY_DIRS})
 ENDIF ()
 
-find_package(Boost 1.66 REQUIRED COMPONENTS system filesystem program_options iostreams)
-include_directories(SYSTEM ${Boost_INCLUDE_DIRS})
-
-find_package(Protobuf REQUIRED)
-include_directories(${PROTOBUF_INCLUDE_DIR})
+find_package(Boost 1.66 REQUIRED COMPONENTS system filesystem program_options)
 
 find_package(libshp REQUIRED)
-include_directories(${LIBSHP_INCLUDE_DIR})
 
 find_package(Rapidjson REQUIRED)
-include_directories(${RAPIDJSON_INCLUDEDIR})
 
 find_package(Lua)
 
@@ -55,9 +46,6 @@ else()
 	add_definitions(-DLUAJIT)
 	include_directories(${LUAJIT_INCLUDE_DIR})
 endif()
-
-find_package(ZLIB REQUIRED)
-include_directories(${ZLIB_INCLUDE_DIR})
 
 set(CMAKE_CXX_STANDARD 17)
 
@@ -70,45 +58,74 @@ endif()
 
 if(MSVC)
  	find_package(unofficial-sqlite3 CONFIG REQUIRED)
-	add_definitions(-D_USE_MATH_DEFINES -DWIN32_LEAN_AND_MEAN -DNOGDI)
+	add_library(SQLite::SQLite3 ALIAS unofficial::sqlite3::sqlite3)
+	add_definitions(-D_USE_MATH_DEFINES -DWIN32_LEAN_AND_MEAN -DNOGDI -D__restrict__=__restrict)
   	set(THREAD_LIB "")
 else()
 	find_package(SQLite3 REQUIRED)
-	include_directories(${SQLITE3_INCLUDE_DIRS})
   	set(THREAD_LIB pthread)
 endif()
 
-ADD_CUSTOM_COMMAND(OUTPUT vector_tile.pb.cc vector_tile.pb.h
-                   COMMAND ${PROTOBUF_PROTOC_EXECUTABLE}
-		   ARGS --cpp_out ${CMAKE_BINARY_DIR} -I ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/include/vector_tile.proto)
-
-ADD_CUSTOM_COMMAND(OUTPUT osmformat.pb.cc osmformat.pb.h
-                   COMMAND ${PROTOBUF_PROTOC_EXECUTABLE}
-		   ARGS --cpp_out ${CMAKE_BINARY_DIR} -I ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/include/osmformat.proto)
-
 file(GLOB tilemaker_src_files
 	src/attribute_store.cpp
-	src/geom.cpp
-	src/mbtiles.cpp
-	src/osm_mem_tiles.cpp
-	src/output_object.cpp
-	src/read_pbf.cpp
-	src/shared_data.cpp
-	src/tile_data.cpp
-	src/tile_worker.cpp
 	src/coordinates.cpp
+	src/coordinates_geom.cpp
+	src/external/streamvbyte_decode.c
+	src/external/streamvbyte_encode.c
+	src/external/streamvbyte_zigzag.c
+	src/external/libdeflate/lib/adler32.c
+	src/external/libdeflate/lib/arm/cpu_features.c
+	src/external/libdeflate/lib/crc32.c
+	src/external/libdeflate/lib/deflate_compress.c
+	src/external/libdeflate/lib/deflate_decompress.c
+	src/external/libdeflate/lib/gzip_compress.c
+	src/external/libdeflate/lib/gzip_decompress.c
+	src/external/libdeflate/lib/utils.c
+	src/external/libdeflate/lib/x86/cpu_features.c
+	src/external/libdeflate/lib/zlib_compress.c
+	src/external/libdeflate/lib/zlib_decompress.c
+	src/geojson_processor.cpp
+	src/geom.cpp
 	src/helpers.cpp
+	src/mbtiles.cpp
+	src/mmap_allocator.cpp
+	src/node_stores.cpp
+	src/options_parser.cpp
 	src/osm_lua_processing.cpp
+	src/osm_mem_tiles.cpp
 	src/osm_store.cpp
-	src/pbf_blocks.cpp
-	src/read_shp.cpp
+	src/output_object.cpp
+	src/pbf_processor.cpp
+	src/pbf_reader.cpp
+	src/pmtiles.cpp
+	src/pooled_string.cpp
+	src/relation_roles.cpp
+	src/sharded_node_store.cpp
+	src/sharded_way_store.cpp
+	src/shared_data.cpp
 	src/shp_mem_tiles.cpp
+	src/shp_processor.cpp
+	src/significant_tags.cpp
+	src/sorted_node_store.cpp
+	src/sorted_way_store.cpp
+	src/tag_map.cpp
+	src/tile_coordinates_set.cpp
+	src/tile_data.cpp
 	src/tilemaker.cpp
-	src/write_geometry.cpp
+	src/tile_worker.cpp
+	src/visvalingam.cpp
+	src/way_stores.cpp
   )
-add_executable(tilemaker vector_tile.pb.cc osmformat.pb.cc ${tilemaker_src_files})
-target_link_libraries(tilemaker ${PROTOBUF_LIBRARY} ${LIBSHP_LIBRARIES} ${SQLITE3_LIBRARIES} ${LUAJIT_LIBRARY} ${LUA_LIBRARIES} ${ZLIB_LIBRARY} ${THREAD_LIB} ${CMAKE_DL_LIBS}
-	Boost::system Boost::filesystem Boost::program_options Boost::iostreams)
+add_executable(tilemaker ${tilemaker_src_files})
+target_include_directories(tilemaker PRIVATE include)
+target_include_directories(tilemaker PRIVATE ${CMAKE_BINARY_DIR}) # for generated files
+target_link_libraries(tilemaker
+		${THREAD_LIB} ${CMAKE_DL_LIBS}
+		${LUA_LIBRARIES}
+		shapelib::shp
+		SQLite::SQLite3
+		Rapidjson::rapidjson
+		Boost::system Boost::filesystem Boost::program_options)
 
 include(CheckCxxAtomic)
 if(NOT HAVE_CXX11_ATOMIC)
@@ -116,10 +133,10 @@ if(NOT HAVE_CXX11_ATOMIC)
 	" ${LIBATOMIC_LINK_FLAGS}")
 endif()
 
-if(MSVC)
-    target_link_libraries(tilemaker unofficial::sqlite3::sqlite3)
-endif()
-
 install(FILES docs/man/tilemaker.1 DESTINATION share/man/man1)
 
-install(TARGETS tilemaker RUNTIME DESTINATION bin)
+add_executable(tilemaker-server server/server.cpp)
+target_include_directories(tilemaker-server PRIVATE include)
+target_link_libraries(tilemaker-server ${THREAD_LIB} ${CMAKE_DL_LIBS} SQLite::SQLite3 Boost::filesystem Boost::program_options)
+
+install(TARGETS tilemaker tilemaker-server RUNTIME DESTINATION bin)

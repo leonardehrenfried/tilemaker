@@ -4,31 +4,33 @@
 
 Install all dependencies with Homebrew:
 
-    brew install protobuf boost lua51 shapelib rapidjson
+    brew install boost lua shapelib rapidjson
 
 Then:
 
     make
     sudo make install
 
-### Ubuntu
+(System Integrity Protection on macOS prevents the manpages being installed. This isn't important: ignore the two lines saying "Operation not permitted".)
+
+### Ubuntu and Debian
 
 Start with:
 
-    sudo apt install build-essential libboost-dev libboost-filesystem-dev libboost-iostreams-dev libboost-program-options-dev libboost-system-dev liblua5.1-0-dev libprotobuf-dev libshp-dev libsqlite3-dev protobuf-compiler rapidjson-dev
+    sudo apt install build-essential libboost-dev libboost-filesystem-dev libboost-program-options-dev libboost-system-dev lua5.1 liblua5.1-0-dev libshp-dev libsqlite3-dev rapidjson-dev
 
 Once you've installed those, then `cd` back to your Tilemaker directory and simply:
 
     make
     sudo make install
 
-If it fails, check that the LIB and INC lines in the Makefile correspond with your system, then try again.
+If it fails, check that the LIB and INC lines in the Makefile correspond with your system, then try again. The above lines install Lua 5.1, but you can also choose any newer version.
 
 ### Fedora
 
 Start with:
 
-    dnf install lua-devel luajit-devel sqlite-devel protobuf-devel protobuf-compiler shapelib-devel rapidjson
+    dnf install lua-devel luajit-devel sqlite-devel shapelib-devel rapidjson-devel boost-devel
 
 then build either with lua:
 
@@ -58,18 +60,17 @@ Build from project root directory with:
 
     docker build . -t tilemaker
 
+It can also be build with a `BUILD_DEBUG` build argument, which will build the executables for Debug, and not strip out symbols. `gdb` will also
+installed to facilate debugging:
+
+    docker build . --build-arg BUILD_DEBUG=1 -t tilemaker
+
 The docker container can be run like this:
 
-    docker run -v /Users/Local/Downloads/:/srv -i -t --rm tilemaker /srv/germany-latest.osm.pbf --output=/srv/germany.mbtiles
+    docker run -it --rm -v $(pwd):/data tilemaker /data/monaco-latest.osm.pbf --output /data/monaco-latest.pmtiles
+
+The tilemaker-server can be run like this:
+
+    docker run -it --rm -v $(pwd):/data --entrypoint /usr/src/app/tilemaker-server tilemaker --help
 
 Keep in mind to map the volume your .osm.pbf files are in to a path within your docker container, as seen in the example above. 
-
-### Compile-time options
-
-tilemaker has two compile-time options that increase memory usage but may be useful in certain circumstances. You can include them when building like this:
-
-    make "CONFIG=-DFLOAT_Z_ORDER"
-
-FLOAT_Z_ORDER allows you to use a full range of ZOrder values in your Lua script, rather than being restricted to single-byte integer (-127 to 127).
-
-FAT_TILE_INDEX allows you to generate vector tiles at zoom level 17 or greater. You almost certainly don't need to do this. Vector tiles are usually generated up to zoom 14 (sometimes 15), and then the browser/app client uses the vector data to scale up at subsequent zoom levels.

@@ -7,9 +7,11 @@
 
 #include "rapidjson/document.h"
 
+#include "options_parser.h"
 #include "osm_store.h"
 #include "output_object.h"
 #include "mbtiles.h"
+#include "pmtiles.h"
 #include "tile_data.h"
 
 ///\brief Defines map single layer appearance
@@ -21,17 +23,28 @@ struct LayerDef {
 	double simplifyLevel;
 	double simplifyLength;
 	double simplifyRatio;
+	uint simplifyAlgo;
 	uint filterBelow;
 	double filterArea;
 	uint combinePolygonsBelow;
 	bool sortZOrderAscending;
+	uint featureLimit;
+	uint featureLimitBelow;
+	bool combinePoints;
 	std::string source;
 	std::vector<std::string> sourceColumns;
 	bool allSourceColumns;
 	bool indexed;
 	std::string indexName;
-	std::map<std::string, uint> attributeMap;
+	std::map<std::string, uint> attributeMap; // string 0, number 1, bool 2
 	bool writeTo;
+	
+	const bool useColumn(std::string &col) {
+		return allSourceColumns || (std::find(sourceColumns.begin(), sourceColumns.end(), col) != sourceColumns.end());
+	}
+	
+	static const uint DOUGLAS_PEUCKER = 0;
+	static const uint VISVALINGAM = 1;
 };
 
 ///\brief Defines layers used in map rendering
@@ -44,8 +57,9 @@ public:
 
 	// Define a layer (as read from the .json file)
 	uint addLayer(std::string name, uint minzoom, uint maxzoom,
-			uint simplifyBelow, double simplifyLevel, double simplifyLength, double simplifyRatio, 
+			uint simplifyBelow, double simplifyLevel, double simplifyLength, double simplifyRatio, uint simplifyAlgo,
 			uint filterBelow, double filterArea, uint combinePolygonsBelow, bool sortZOrderAscending,
+			uint featureLimit, uint featureLimitBelow, bool combinePoints,
 			const std::string &source,
 			const std::vector<std::string> &sourceColumns,
 			bool allSourceColumns,
@@ -83,15 +97,22 @@ class SharedData {
 
 public:
 	const class LayerDefinition &layers;
-	bool sqlite;
+	OptionsParser::OutputMode outputMode;
 	bool mergeSqlite;
 	MBTiles mbtiles;
+	PMTiles pmtiles;
 	std::string outputFile;
 
 	Config &config;
 
 	SharedData(Config &configIn, const class LayerDefinition &layers);
 	virtual ~SharedData();
+
+	void writeMBTilesProjectData();
+	void writeMBTilesMetadata(rapidjson::Document const &jsonConfig);
+	void writeFileMetadata(rapidjson::Document const &jsonConfig);	
+	std::string pmTilesMetadata();
+	void writePMTilesBounds();
 };
 
 #endif //_SHARED_DATA_H

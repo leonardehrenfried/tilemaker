@@ -19,9 +19,10 @@ The `--config` and `--process` arguments are the paths of your JSON config file 
 processing script. These are described in CONFIGURATION.md. Here we're using the ready-made 
 OpenMapTiles-compatible script.
 
-You'll usually want to write to an .mbtiles file (which, under the hood, is an sqlite database 
-containing the vector tiles). However, you can write tiles directly to the filesystem if you 
-like, by specifying a directory path for `--output`.
+You can output to an .mbtiles or .pmtiles file. mbtiles is widely supported and easy to serve 
+(it's an sqlite database under the hood). [pmtiles](https://github.com/protomaps/PMTiles) is 
+a newer format optimised for serving over the cloud. You can also write tiles directly to the 
+filesystem by specifying a directory path for `--output`.
 
 This is all you need to know, but if you want to reduce memory requirements, read on.
 
@@ -32,8 +33,41 @@ to writing them out as vector tiles. This is fine for small regions, but can imp
 requirements for larger areas.
 
 To use on-disk storage instead, pass the `--store` argument with a path to the directory where 
-you want the temporary store to be created. This should be on an SSD or other fast disk. 
-Tilemaker will grow the store as required.
+you want the temporary store to be created - on an SSD or other fast disk. This allows you 
+to process bigger areas even on memory-constrained systems.
+
+## Performance and memory tuning
+
+By default, tilemaker aims to balance memory usage with speed, but with a slight tilt towards 
+minimising memory. You can get faster runtimes, at the expense of a little more memory, by 
+specifying `--fast`.
+
+This is all most people will need to know. But if you have plentiful RAM, you can experiment 
+with these options. In general, options that use more memory run faster - but if you can 
+optimise memory such that your dataset fits entirely in RAM, this will be a big speed-up.
+(`--fast` simply chooses a set of these options for you.)
+
+* `--compact`: Use a smaller, faster data structure for node lookups. __Note__: This requires 
+the .pbf to have nodes in sequential order, typically by using `osmium renumber`.
+* `--no-compress-nodes` and `--no-compress-ways`: Turn off node/way compression. Increases 
+RAM usage but runs faster.
+* `--materialize-geometries`: Generate geometries in advance when reading .pbf. Increases RAM 
+usage but runs faster.
+* `--shard-stores`: Group temporary storage by area. Reduces RAM usage on large files (e.g.
+whole planet) but runs slower.
+
+You can also tell tilemaker to only look at .pbf objects with certain tags. If you're making a 
+thematic map, this allows tilemaker to skip data it won't need. Specify this in your Lua file 
+like one of these three examples:
+
+    -- Only include major roads
+    way_keys = {"highway=motorway", "highway=trunk", "highway=primary", "highway=secondary"}`
+
+    -- Only include railways
+    way_keys = {"railway"}
+
+    -- Include everything but not buildings
+    way_keys = {"~building"}
 
 ## Merging
 
@@ -57,30 +91,40 @@ Then rerun with another .pbf, using the `--merge` flag:
 The second run will proceed a little more slowly due to reading in existing tiles in areas which 
 overlap. Any OSM objects which appear in both files will be written twice.
 
-For very large areas, you could potentially use `osmium tags-filter` to split a .pbf into several 
-"thematic" extracts: for example, one containing buildings, another roads, and another landuse. 
-Renumber each one, then run tilemaker several times with `--merge` to add one theme at a time. 
-This would greatly reduce memory usage.
+### Creating a map with varying detail
 
-## Pre-split data
+A map with global coastline, but detailed mapping only for a specific region, is a common use case.
+You can use tilemaker's `--merge` switch to achieve this.
 
-Tilemaker is able to read pre-split source data, where the original .osm.pbf has already been 
-split into tiled areas (but not converted any further). By reducing the amount of data tilemaker 
-has to process at any one time, this can greatly reduce memory requirements.
+First, create a global coastline .mbtiles. There's a special stripped down config for this:
 
-To split an .osm.pbf, use [mapsplit](https://github.com/simonpoole/mapsplit). This will output 
-an .msf file. We would recommend that you split the data at a low zoom level, such as 6; 
-tilemaker will not be able to generate vector tiles at a lower zoom level than the one you 
-choose for your .msf file.
+    tilemaker --output coastline.mbtiles \
+              --bbox -180,-85,180,85 \
+              --process resources/process-coastline.lua \
+              --config resources/config-coastline.json
 
-You can then run tilemaker exactly as normal, with the `--input` parameter set to your .msf 
-file. Source tiles will be processed one by one. Note that shapefiles will be read unsplit as 
-normal.
+Save this .mbtiles somewhere; then make a copy, and call it output.mbtiles.
+
+Edit `resources/config-openmaptiles.json` to remove the `ocean`, `urban_areas`, `ice_shelf` and 
+`glacier` layers (because we've already generated these).
+
+Now simply merge the region you want into the coastline .mbtiles you generated:
+
+    tilemaker --input new-zealand.osm.pbf \
+              --output output.mbtiles \
+              --merge \
+              --process resources/process-openmaptiles.lua \
+              --config resources/config-openmaptiles.json
+
+Don't forget to add `--store /path/to/your/ssd` if you don't have lots of RAM.
 
 ## Output messages
 
 Running tilemaker with the `--verbose` argument will output any issues encountered during tile
 creation.
+
+Running tilemaker with the `--quiet` argument will suppress anything written to stdout during
+tile creation. stderr is unaffected.
 
 You may see geometry errors reported by Boost::Geometry. This typically reflects an error 
 in the OSM source data (for example, a multipolygon with several inner rings but no outer ring).
@@ -111,7 +155,7 @@ Here is an example:
     # Required, same to --output. Could be a directory or a .mbtiles files
     output: /path/to/output
     # Optional, same to --config
-    # If not being set, default to resources/config-openmaptiles.config
+    # If not being set, default to resources/config-openmaptiles.json
     config: /path/to/config
     # Optional, same to --process
     # If not being set, default to resources/process-openmaptiles.lua

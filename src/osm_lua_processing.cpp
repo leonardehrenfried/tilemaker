@@ -1,79 +1,312 @@
-#include "osm_lua_processing.h"
-#include "helpers.h"
 #include <iostream>
 
+#include "osm_lua_processing.h"
+#include "attribute_store.h"
+#include "helpers.h"
+#include "coordinates_geom.h"
+#include "osm_mem_tiles.h"
+#include "significant_tags.h"
+#include "tag_map.h"
+#include "node_store.h"
+#include "polylabel.h"
+#include <signal.h>
 
 using namespace std;
 
+const std::string EMPTY_STRING = "";
 thread_local kaguya::State *g_luaState = nullptr;
+thread_local OsmLuaProcessing* osmLuaProcessing = nullptr;
+
+std::mutex vectorLayerMetadataMutex;
+std::unordered_map<std::string, std::string> OsmLuaProcessing::dataStore;
+std::mutex OsmLuaProcessing::dataStoreMutex;
+
+void handleOsmLuaProcessingUserSignal(int signum) {
+	osmLuaProcessing->handleUserSignal(signum);
+}
+
+class Sigusr1Handler {
+public:
+	Sigusr1Handler() {
+#ifndef _WIN32
+		signal(SIGUSR1, handleOsmLuaProcessingUserSignal);
+#endif
+	}
+
+	void initialize() {
+		// No-op just to ensure the compiler doesn't optimize away
+		// the handler.
+	}
+};
+
+thread_local Sigusr1Handler sigusr1Handler;
+
+// A key in `currentTags`. If Lua code refers to an absent key,
+// found will be false.
+struct KnownTagKey {
+	bool found;
+	uint32_t index;
+
+	// stringValue is populated only in PostScanRelations phase; we could consider
+	// having osm_store's relationTags use TagMap, in which case we'd be able to
+	// use the found/index fields
+	std::string stringValue;
+};
+
+template<>  struct kaguya::lua_type_traits<KnownTagKey> {
+	typedef KnownTagKey get_type;
+	typedef const KnownTagKey& push_type;
+
+	static bool strictCheckType(lua_State* l, int index)
+	{
+		return lua_type(l, index) == LUA_TSTRING;
+	}
+	static bool checkType(lua_State* l, int index)
+	{
+		return lua_isstring(l, index) != 0;
+	}
+	static get_type get(lua_State* l, int index)
+	{
+		KnownTagKey rv = { false, 0 };
+		size_t size = 0;
+		const char* buffer = lua_tolstring(l, index, &size);
+
+		if (osmLuaProcessing->isPostScanRelation) {
+			// In this phase, the Holds/Find functions directly query a
+			// traditional string->string map, so just ensure we expose
+			// the string.
+			rv.stringValue = std::string(buffer, size);
+			return rv;
+		}
+
+
+		int64_t tagLoc = osmLuaProcessing->currentTags->getKey(buffer, size);
+
+		if (tagLoc >= 0) {
+			rv.found = true;
+			rv.index = tagLoc;
+		}
+//		std::string key(buffer, size);
+//		std::cout << "for key " << key << ": rv.found=" << rv.found << ", rv.index=" << rv.index << std::endl;
+		return rv;
+	}
+	static int push(lua_State* l, push_type s)
+	{
+		throw std::runtime_error("Lua code doesn't know how to use KnownTagKey");
+	}
+};
+
+template<>  struct kaguya::lua_type_traits<protozero::data_view> {
+	typedef protozero::data_view get_type;
+	typedef const protozero::data_view& push_type;
+
+	static bool strictCheckType(lua_State* l, int index)
+	{
+		return lua_type(l, index) == LUA_TSTRING;
+	}
+	static bool checkType(lua_State* l, int index)
+	{
+		return lua_isstring(l, index) != 0;
+	}
+	static get_type get(lua_State* l, int index)
+	{
+		size_t size = 0;
+		const char* buffer = lua_tolstring(l, index, &size);
+		protozero::data_view rv = { buffer, size };
+		return rv;
+	}
+	static int push(lua_State* l, push_type s)
+	{
+		throw std::runtime_error("Lua code doesn't know how to use protozero::data_view");
+	}
+};
+
+// Gets a table of all the keys of the OSM tags
+kaguya::LuaTable getAllKeys(kaguya::State& luaState, const boost::container::flat_map<std::string, std::string>* tags) {
+	kaguya::LuaTable tagsTable = luaState.newTable();
+	int index = 1; // Lua is 1-based
+	for (const auto& kv: *tags) {
+		tagsTable[index++] = kv.first;
+	}
+	return tagsTable;
+}
+
+// Gets a table of all the OSM tags
+kaguya::LuaTable getAllTags(kaguya::State& luaState, const boost::container::flat_map<std::string, std::string>* tags) {
+	kaguya::LuaTable tagsTable = luaState.newTable();
+	for (const auto& kv: *tags) {
+		tagsTable[kv.first] = kv.second;
+	}
+	return tagsTable;
+}
+
+std::string rawId() { return osmLuaProcessing->Id(); }
+kaguya::LuaTable rawAllKeys() {
+	if (osmLuaProcessing->isPostScanRelation) {
+		return osmLuaProcessing->AllKeys(*g_luaState);
+	}
+
+	auto tags = osmLuaProcessing->currentTags->exportToBoostMap();
+
+	return getAllKeys(*g_luaState, &tags);
+}kaguya::LuaTable rawAllTags() {
+	if (osmLuaProcessing->isPostScanRelation) {
+		return osmLuaProcessing->AllTags(*g_luaState);
+	}
+
+	auto tags = osmLuaProcessing->currentTags->exportToBoostMap();
+
+	return getAllTags(*g_luaState, &tags);
+}
+bool rawHolds(const KnownTagKey& key) {
+	if (osmLuaProcessing->isPostScanRelation) {
+		return osmLuaProcessing->Holds(key.stringValue);
+	}
+
+	return key.found;
+}
+bool rawHasTags() { return osmLuaProcessing->HasTags(); }
+void rawSetTag(const std::string &key, const std::string &value) { return osmLuaProcessing->SetTag(key, value); }
+const std::string rawFind(const KnownTagKey& key) {
+	if (osmLuaProcessing->isPostScanRelation)
+		return osmLuaProcessing->Find(key.stringValue);
+
+	if (key.found) {
+		auto value = *(osmLuaProcessing->currentTags->getValueFromKey(key.index));
+		return std::string(value.data(), value.size());
+	}
+
+	return EMPTY_STRING;
+}
+std::vector<std::string> rawFindIntersecting(const std::string &layerName) { return osmLuaProcessing->FindIntersecting(layerName); }
+bool rawIntersects(const std::string& layerName) { return osmLuaProcessing->Intersects(layerName); }
+std::vector<std::string> rawFindCovering(const std::string& layerName) { return osmLuaProcessing->FindCovering(layerName); }
+bool rawCoveredBy(const std::string& layerName) { return osmLuaProcessing->CoveredBy(layerName); }
+bool rawIsClosed() { return osmLuaProcessing->IsClosed(); }
+bool rawIsMultiPolygon() { return osmLuaProcessing->IsMultiPolygon(); }
+double rawArea() { return osmLuaProcessing->Area(); }
+double rawLength() { return osmLuaProcessing->Length(); }
+kaguya::optional<std::vector<double>> rawCentroid(kaguya::VariadicArgType algorithm) { return osmLuaProcessing->Centroid(algorithm); }
+void rawLayer(const std::string& layerName, bool area) { return osmLuaProcessing->Layer(layerName, area); }
+void rawLayerAsCentroid(const std::string &layerName, kaguya::VariadicArgType nodeSources) { return osmLuaProcessing->LayerAsCentroid(layerName, nodeSources); }
+void rawMinZoom(const double z) { return osmLuaProcessing->MinZoom(z); }
+void rawZOrder(const double z) { return osmLuaProcessing->ZOrder(z); }
+OsmLuaProcessing::OptionalRelation rawNextRelation() { return osmLuaProcessing->NextRelation(); }
+void rawRestartRelations() { return osmLuaProcessing->RestartRelations(); }
+std::string rawFindInRelation(const std::string& key) { return osmLuaProcessing->FindInRelation(key); }
+void rawAccept() { return osmLuaProcessing->Accept(); }
+double rawAreaIntersecting(const std::string& layerName) { return osmLuaProcessing->AreaIntersecting(layerName); }
+
+void rawSetData(const std::string &key, const std::string &value) { 
+	std::lock_guard<std::mutex> lock(osmLuaProcessing->dataStoreMutex);
+	osmLuaProcessing->dataStore[key] = value;
+}
+std::string rawGetData(const std::string &key) {
+	auto r = osmLuaProcessing->dataStore.find(key);
+	return r==osmLuaProcessing->dataStore.end() ? "" : r->second;
+}
+
 bool supportsRemappingShapefiles = false;
 
 int lua_error_handler(int errCode, const char *errMessage)
 {
-	cerr << "lua runtime error: " << errMessage << endl;
-	std::string traceback = (*g_luaState)["debug"]["traceback"];
-	cerr << "traceback: " << traceback << endl;
-	exit(0);
+	std::cerr << "lua runtime error " << std::to_string(errCode) << ":" << std::endl;
+	std::cerr << errMessage << std::endl;
+	kaguya::util::traceBack(g_luaState->state(), errMessage); // full traceback on 5.2+
+	kaguya::util::stackDump(g_luaState->state());
+	throw OsmLuaProcessing::luaProcessingException();
 }
 
 // ----	initialization routines
 
 OsmLuaProcessing::OsmLuaProcessing(
-    OSMStore &osmStore,
-    const class Config &configIn, class LayerDefinition &layers,
+	OSMStore &osmStore,
+	const class Config &configIn,
+	class LayerDefinition &layers,
 	const string &luaFile,
 	const class ShpMemTiles &shpMemTiles, 
 	class OsmMemTiles &osmMemTiles,
-	AttributeStore &attributeStore):
+	AttributeStore &attributeStore,
+	bool materializeGeometries,
+	bool isFirst) :
 	osmStore(osmStore),
 	shpMemTiles(shpMemTiles),
 	osmMemTiles(osmMemTiles),
 	attributeStore(attributeStore),
 	config(configIn),
-	layers(layers) {
+	currentTags(NULL),
+	layers(layers),
+	materializeGeometries(materializeGeometries) {
+
+	sigusr1Handler.initialize();
 
 	// ----	Initialise Lua
 	g_luaState = &luaState;
 	luaState.setErrorHandler(lua_error_handler);
 	luaState.dofile(luaFile.c_str());
-	luaState["OSM"].setClass(kaguya::UserdataMetatable<OsmLuaProcessing>()
-		.addFunction("Id", &OsmLuaProcessing::Id)
-		.addFunction("Holds", &OsmLuaProcessing::Holds)
-		.addFunction("Find", &OsmLuaProcessing::Find)
-		.addFunction("FindIntersecting", &OsmLuaProcessing::FindIntersecting)
-		.addFunction("Intersects", &OsmLuaProcessing::Intersects)
-		.addFunction("FindCovering", &OsmLuaProcessing::FindCovering)
-		.addFunction("CoveredBy", &OsmLuaProcessing::CoveredBy)
-		.addFunction("IsClosed", &OsmLuaProcessing::IsClosed)
-		.addFunction("Area", &OsmLuaProcessing::Area)
-		.addFunction("AreaIntersecting", &OsmLuaProcessing::AreaIntersecting)
-		.addFunction("Length", &OsmLuaProcessing::Length)
-		.addFunction("Centroid", &OsmLuaProcessing::Centroid)
-		.addFunction("Layer", &OsmLuaProcessing::Layer)
-		.addFunction("LayerAsCentroid", &OsmLuaProcessing::LayerAsCentroid)
-		.addOverloadedFunctions("Attribute", &OsmLuaProcessing::Attribute, &OsmLuaProcessing::AttributeWithMinZoom)
-		.addOverloadedFunctions("AttributeNumeric", &OsmLuaProcessing::AttributeNumeric, &OsmLuaProcessing::AttributeNumericWithMinZoom)
-		.addOverloadedFunctions("AttributeBoolean", &OsmLuaProcessing::AttributeBoolean, &OsmLuaProcessing::AttributeBooleanWithMinZoom)
-		.addFunction("MinZoom", &OsmLuaProcessing::MinZoom)
-		.addOverloadedFunctions("ZOrder", &OsmLuaProcessing::ZOrder, &OsmLuaProcessing::ZOrderWithScale)
-		.addFunction("Accept", &OsmLuaProcessing::Accept)
-		.addFunction("NextRelation", &OsmLuaProcessing::NextRelation)
-		.addFunction("FindInRelation", &OsmLuaProcessing::FindInRelation)
+
+	osmLuaProcessing = this;
+	luaState["Id"] = &rawId;
+	luaState["AllKeys"] = &rawAllKeys;
+	luaState["AllTags"] = &rawAllTags;
+	luaState["Holds"] = &rawHolds;
+	luaState["Find"] = &rawFind;
+	luaState["HasTags"] = &rawHasTags;
+	luaState["SetTag"] = &rawSetTag;
+	luaState["FindIntersecting"] = &rawFindIntersecting;
+	luaState["Intersects"] = &rawIntersects;
+	luaState["FindCovering"] = &rawFindCovering;
+	luaState["CoveredBy"] = &rawCoveredBy;
+	luaState["IsClosed"] = &rawIsClosed;
+	luaState["IsMultiPolygon"] = &rawIsMultiPolygon;
+	luaState["Area"] = &rawArea;
+	luaState["AreaIntersecting"] = &rawAreaIntersecting;
+	luaState["Length"] = &rawLength;
+	luaState["Centroid"] = &rawCentroid;
+	luaState["Layer"] = &rawLayer;
+	luaState["LayerAsCentroid"] = &rawLayerAsCentroid;
+	luaState["Attribute"] = kaguya::overload(
+			[](const std::string &key, const protozero::data_view val) { osmLuaProcessing->Attribute(key, val, 0); },
+			[](const std::string &key, const protozero::data_view val, const char minzoom) { osmLuaProcessing->Attribute(key, val, minzoom); }
 	);
+	luaState["AttributeNumeric"] = kaguya::overload(
+			[](const std::string &key, const float val) { osmLuaProcessing->AttributeNumeric(key, val, 0); },
+			[](const std::string &key, const float val, const char minzoom) { osmLuaProcessing->AttributeNumeric(key, val, minzoom); }
+	);
+	luaState["AttributeBoolean"] = kaguya::overload(
+			[](const std::string &key, const bool val) { osmLuaProcessing->AttributeBoolean(key, val, 0); },
+			[](const std::string &key, const bool val, const char minzoom) { osmLuaProcessing->AttributeBoolean(key, val, minzoom); }
+	);
+
+	luaState["MinZoom"] = &rawMinZoom;
+	luaState["ZOrder"] = &rawZOrder;
+	luaState["Accept"] = &rawAccept;
+	luaState["NextRelation"] = &rawNextRelation;
+	luaState["RestartRelations"] = &rawRestartRelations;
+	luaState["FindInRelation"] = &rawFindInRelation;
+	luaState["SetData"] = &rawSetData;
+	luaState["GetData"] = &rawGetData;
 	supportsRemappingShapefiles = !!luaState["attribute_function"];
 	supportsReadingRelations    = !!luaState["relation_scan_function"];
+	supportsPostScanRelations   = !!luaState["relation_postscan_function"];
+	supportsWritingNodes        = !!luaState["node_function"];
+	supportsWritingWays         = !!luaState["way_function"];
 	supportsWritingRelations    = !!luaState["relation_function"];
 
 	// ---- Call init_function of Lua logic
 
 	if (!!luaState["init_function"]) {
-		luaState["init_function"](this->config.projectName);
+		luaState["init_function"](this->config.projectName, isFirst);
 	}
 }
 
 OsmLuaProcessing::~OsmLuaProcessing() {
 	// Call exit_function of Lua logic
 	luaState("if exit_function~=nil then exit_function() end");
+}
+
+void OsmLuaProcessing::handleUserSignal(int signum) {
+	std::cout << "processing OSM ID " << originalOsmID << std::endl;
 }
 
 // ----	Helpers provided for main routine
@@ -89,6 +322,18 @@ bool OsmLuaProcessing::canRemapShapefiles() {
 
 bool OsmLuaProcessing::canReadRelations() {
 	return supportsReadingRelations;
+}
+
+bool OsmLuaProcessing::canPostScanRelations() {
+	return supportsPostScanRelations;
+}
+
+bool OsmLuaProcessing::canWriteNodes() {
+	return supportsWritingNodes;
+}
+
+bool OsmLuaProcessing::canWriteWays() {
+	return supportsWritingWays;
 }
 
 bool OsmLuaProcessing::canWriteRelations() {
@@ -111,16 +356,35 @@ string OsmLuaProcessing::Id() const {
 	return to_string(originalOsmID);
 }
 
+// Gets a table of all the keys of the OSM tags
+kaguya::LuaTable OsmLuaProcessing::AllKeys(kaguya::State& luaState) {
+	// NOTE: this is only called in the PostScanRelation phase -- other phases are handled in rawAllKeys
+	return getAllKeys(luaState, currentPostScanTags);
+}
+
+// Gets a table of all the OSM tags
+kaguya::LuaTable OsmLuaProcessing::AllTags(kaguya::State& luaState) {
+	// NOTE: this is only called in the PostScanRelation phase -- other phases are handled in rawAllTags
+	return getAllTags(luaState, currentPostScanTags);
+}
+
 // Check if there's a value for a given key
 bool OsmLuaProcessing::Holds(const string& key) const {
-	return currentTags.find(key) != currentTags.end();
+	// NOTE: this is only called in the PostScanRelation phase -- other phases are handled in rawHolds
+	return currentPostScanTags->find(key)!=currentPostScanTags->end();
 }
 
 // Get an OSM tag for a given key (or return empty string if none)
-string OsmLuaProcessing::Find(const string& key) const {
-	auto it = currentTags.find(key);
-	if(it == currentTags.end()) return "";
+const string OsmLuaProcessing::Find(const string& key) const {
+	// NOTE: this is only called in the PostScanRelation phase -- other phases are handled in rawFind
+	auto it = currentPostScanTags->find(key);
+	if (it == currentPostScanTags->end()) return EMPTY_STRING;
 	return it->second;
+}
+
+// Check if an object has any tags
+bool OsmLuaProcessing::HasTags() const {
+	return isPostScanRelation ? !currentPostScanTags->empty() : !currentTags->empty();
 }
 
 // ----	Spatial queries called from Lua
@@ -167,6 +431,9 @@ double OsmLuaProcessing::AreaIntersecting(const string &layerName) {
 template <typename GeometryT>
 std::vector<uint> OsmLuaProcessing::intersectsQuery(const string &layerName, bool once, GeometryT &geom) const {
 	Box box; geom::envelope(geom, box);
+	if (!shpMemTiles.mayIntersect(layerName, box))
+		return std::vector<uint>();
+
 	std::vector<uint> ids = shpMemTiles.QueryMatchingGeometries(layerName, once, box,
 		[&](const RTree &rtree) { // indexQuery
 			vector<IndexValue> results;
@@ -174,7 +441,7 @@ std::vector<uint> OsmLuaProcessing::intersectsQuery(const string &layerName, boo
 			return results;
 		},
 		[&](OutputObject const &oo) { // checkQuery
-			return geom::intersects(geom, osmStore.retrieve_multi_polygon(osmStore.shp(), oo.objectID));
+			return geom::intersects(geom, shpMemTiles.retrieveMultiPolygon(oo.objectID));
 		}
 	);
 	return ids;
@@ -192,7 +459,7 @@ double OsmLuaProcessing::intersectsArea(const string &layerName, GeometryT &geom
 		},
 		[&](OutputObject const &oo) { // checkQuery
 			MultiPolygon tmp;
-			geom::intersection(geom, osmStore.retrieve_multi_polygon(osmStore.shp(), oo.objectID), tmp);
+			geom::intersection(geom, shpMemTiles.retrieveMultiPolygon(oo.objectID), tmp);
 			area += multiPolygonArea(tmp);
 			return false;
 		}
@@ -211,7 +478,7 @@ std::vector<uint> OsmLuaProcessing::coveredQuery(const string &layerName, bool o
 		},
 		[&](OutputObject const &oo) { // checkQuery
 			if (oo.geomType!=POLYGON_) return false; // can only be covered by a polygon!
-			return geom::covered_by(geom, osmStore.retrieve_multi_polygon(osmStore.shp(), oo.objectID));
+			return geom::covered_by(geom, shpMemTiles.retrieveMultiPolygon(oo.objectID));
 		}
 	);
 	return ids;
@@ -221,6 +488,11 @@ std::vector<uint> OsmLuaProcessing::coveredQuery(const string &layerName, bool o
 bool OsmLuaProcessing::IsClosed() const {
 	if (!isWay) return false; // nonsense: it isn't a way
 	return isClosed;
+}
+
+// Return whether it's a multipolygon
+bool OsmLuaProcessing::IsMultiPolygon() const {
+	return isWay && isRelation;
 }
 
 void reverse_project(DegPoint& p) {
@@ -268,7 +540,7 @@ double OsmLuaProcessing::multiPolygonArea(const MultiPolygon &mp) const {
 
 // Returns length
 double OsmLuaProcessing::Length() {
-	if (isWay) {
+	if (isWay && !isRelation) {
 		geom::model::linestring<DegPoint> l;
 		geom::assign(l, linestringCached());
 		geom::for_each_point(l, reverse_project);
@@ -317,24 +589,36 @@ const MultiPolygon &OsmLuaProcessing::multiPolygonCached() {
 
 // Add object to specified layer from Lua
 void OsmLuaProcessing::Layer(const string &layerName, bool area) {
+	outputKeys.clear();
 	if (layers.layerMap.count(layerName) == 0) {
 		throw out_of_range("ERROR: Layer(): a layer named as \"" + layerName + "\" doesn't exist.");
 	}
 
 	uint layerMinZoom = layers.layers[layers.layerMap[layerName]].minzoom;
+	AttributeSet attributes;
 	OutputGeometryType geomType = isRelation ? (area ? POLYGON_ : MULTILINESTRING_ ) :
 	                                   isWay ? (area ? POLYGON_ : LINESTRING_) : POINT_;
 	try {
+		// Lua profiles often write the same geometry twice, e.g. a river and its name,
+		// a highway and its name. Avoid duplicating geometry processing and storage
+		// when this occurs.
+		if (lastStoredGeometryId != 0 && lastStoredGeometryType == geomType) {
+			OutputObject oo(geomType, layers.layerMap[layerName], lastStoredGeometryId, 0, layerMinZoom);
+			outputs.push_back(std::make_pair(std::move(oo), attributes));
+			return;
+		}
+
 		if (geomType==POINT_) {
 			Point p = Point(lon, latp);
 
-            if(!CorrectGeometry(p)) return;
+			if(CorrectGeometry(p) == CorrectGeometryResult::Invalid) return;
 
-			osmStore.store_point(osmStore.osm(), osmID, p);
-			OutputObjectRef oo = osmMemTiles.CreateObject(OutputObjectOsmStorePoint(geomType, 
-							layers.layerMap[layerName], osmID, attributeStore.empty_set(), layerMinZoom));
-			outputs.push_back(std::make_pair(oo, attributeStore.empty_set()));
-            return;
+			NodeID id = USE_NODE_STORE | originalOsmID;
+			if (materializeGeometries)
+				id = osmMemTiles.storePoint(p);
+			OutputObject oo(geomType, layers.layerMap[layerName], id, 0, layerMinZoom);
+			outputs.push_back(std::make_pair(std::move(oo), attributes));
+			return;
 		}
 		else if (geomType==POLYGON_) {
 			// polygon
@@ -344,6 +628,10 @@ void OsmLuaProcessing::Layer(const string &layerName, bool area) {
 			if (isRelation) {
 				try {
 					mp = multiPolygonCached();
+					if(CorrectGeometry(mp) == CorrectGeometryResult::Invalid) return;
+					NodeID id = osmMemTiles.storeMultiPolygon(mp);
+					OutputObject oo(geomType, layers.layerMap[layerName], id, 0, layerMinZoom);
+					outputs.push_back(std::make_pair(std::move(oo), attributes));
 				} catch(std::out_of_range &err) {
 					cout << "In relation " << originalOsmID << ": " << err.what() << endl;
 					return;
@@ -354,16 +642,20 @@ void OsmLuaProcessing::Layer(const string &layerName, bool area) {
 				Linestring ls = linestringCached();
 				Polygon p;
 				geom::assign_points(p, ls);
-
 				mp.push_back(p);
+
+				auto correctionResult = CorrectGeometry(mp);
+				if(correctionResult == CorrectGeometryResult::Invalid) return;
+				NodeID id = 0;
+				if (!materializeGeometries && correctionResult == CorrectGeometryResult::Valid) {
+					id = USE_WAY_STORE | originalOsmID;
+					wayEmitted = true;
+				} else 
+					id = osmMemTiles.storeMultiPolygon(mp);
+				OutputObject oo(geomType, layers.layerMap[layerName], id, 0, layerMinZoom);
+				outputs.push_back(std::make_pair(std::move(oo), attributes));
 			}
 
-            if(!CorrectGeometry(mp)) return;
-
-			osmStore.store_multi_polygon(osmStore.osm(), osmID, mp);
-			OutputObjectRef oo = osmMemTiles.CreateObject(OutputObjectOsmStoreMultiPolygon(geomType, 
-							layers.layerMap[layerName], osmID, attributeStore.empty_set(), layerMinZoom));
-			outputs.push_back(std::make_pair(oo, attributeStore.empty_set()));
 		}
 		else if (geomType==MULTILINESTRING_) {
 			// multilinestring
@@ -374,38 +666,118 @@ void OsmLuaProcessing::Layer(const string &layerName, bool area) {
 				cout << "In relation " << originalOsmID << ": " << err.what() << endl;
 				return;
 			}
-			if (!CorrectGeometry(mls)) return;
+			if (CorrectGeometry(mls) == CorrectGeometryResult::Invalid) return;
 
-			osmStore.store_multi_linestring(osmStore.osm(), osmID, mls);
-			OutputObjectRef oo = osmMemTiles.CreateObject(OutputObjectOsmStoreMultiLinestring(geomType, 
-							layers.layerMap[layerName], osmID, attributeStore.empty_set(), layerMinZoom));
-			outputs.push_back(std::make_pair(oo, attributeStore.empty_set()));
+			NodeID id = osmMemTiles.storeMultiLinestring(mls);
+			lastStoredGeometryId = id;
+			lastStoredGeometryType = geomType;
+			OutputObject oo(geomType, layers.layerMap[layerName], id, 0, layerMinZoom);
+			outputs.push_back(std::make_pair(std::move(oo), attributes));
 		}
 		else if (geomType==LINESTRING_) {
 			// linestring
 			Linestring ls = linestringCached();
 
-            if(!CorrectGeometry(ls)) return;
+			auto correctionResult = CorrectGeometry(ls);
+			if(correctionResult == CorrectGeometryResult::Invalid) return;
 
-			osmStore.store_linestring(osmStore.osm(), osmID, ls);
-			OutputObjectRef oo = osmMemTiles.CreateObject(OutputObjectOsmStoreLinestring(geomType, 
-						layers.layerMap[layerName], osmID, attributeStore.empty_set(), layerMinZoom));
-			outputs.push_back(std::make_pair(oo, attributeStore.empty_set()));
+			if (isWay && !isRelation) {
+				NodeID id = 0;
+				if (!materializeGeometries && correctionResult == CorrectGeometryResult::Valid) {
+					id = USE_WAY_STORE | originalOsmID;
+					wayEmitted = true;
+				}	else 
+					id = osmMemTiles.storeLinestring(ls);
+				lastStoredGeometryId = id;
+				lastStoredGeometryType = geomType;
+				OutputObject oo(geomType, layers.layerMap[layerName], id, 0, layerMinZoom);
+				outputs.push_back(std::make_pair(std::move(oo), attributes));
+			} else {
+				NodeID id = osmMemTiles.storeLinestring(ls);
+				lastStoredGeometryId = id;
+				lastStoredGeometryType = geomType;
+				OutputObject oo(geomType, layers.layerMap[layerName], id, 0, layerMinZoom);
+				outputs.push_back(std::make_pair(std::move(oo), attributes));
+			}
 		}
 	} catch (std::invalid_argument &err) {
-		cerr << "Error in OutputObjectOsmStore constructor: " << err.what() << endl;
+		cerr << "Error in OutputObject constructor: " << err.what() << endl;
 	}
 }
 
-void OsmLuaProcessing::LayerAsCentroid(const string &layerName) {
+// LayerAsCentroid(layerName, [centroid-algorithm, [role, [role, ...]]])
+//
+// Emit a point. This function can be called for nodes, ways or relations.
+//
+// When called for a 2D geometry, you can pass a preferred centroid algorithm
+// in `centroid-algorithm`. Currently `polylabel` and `centroid` are supported.
+//
+// When called for a relation, you can pass a list of roles. The point of a node
+// with that role will be used if available.
+void OsmLuaProcessing::LayerAsCentroid(const string &layerName, kaguya::VariadicArgType varargs) {
+	outputKeys.clear();
 	if (layers.layerMap.count(layerName) == 0) {
 		throw out_of_range("ERROR: LayerAsCentroid(): a layer named as \"" + layerName + "\" doesn't exist.");
 	}	
 
+	CentroidAlgorithm algorithm = defaultCentroidAlgorithm();
+
+	for (auto needleRef : varargs) {
+		const std::string needle = needleRef.get<std::string>();
+		algorithm = parseCentroidAlgorithm(needle);
+		break;
+	}
+
+	// This will be non-zero if we ultimately used a node from a relation to
+	// label the point.
+	NodeID relationNode = 0;
+
 	uint layerMinZoom = layers.layers[layers.layerMap[layerName]].minzoom;
+	AttributeSet attributes;
 	Point geomp;
+	bool centroidFound = false;
 	try {
-		geomp = calculateCentroid();
+		// If we're a relation, see if the user would prefer we use one of its members
+		// to label the point.
+		if (isRelation) {
+			int i = -1;
+			for (auto needleRef : varargs) {
+				i++;
+				// Skip the first vararg, it's the algorithm.
+				if (i == 0) continue;
+				const std::string needle = needleRef.get<std::string>();
+
+				// We do a linear search of the relation's members. This is not very efficient
+				// for relations like Tongass National Park (ID 6535292, 29,000 members),
+				// but in general, it's probably fine.
+				//
+				// I note that relation members seem to be sorted nodes first, then ways,
+				// then relations. I'm not sure if we can rely on that, so I don't
+				// short-circuit on the first non-node.
+				for (int i = 0; i < currentRelation->memids.size(); i++) {
+					if (currentRelation->types[i] != PbfReader::Relation::MemberType::NODE)
+						continue;
+
+					const protozero::data_view role = stringTable->at(currentRelation->roles_sid[i]);
+					if (role.size() == needle.size() && 0 == memcmp(role.data(), needle.data(), role.size())) {
+						relationNode = currentRelation->memids[i];
+						const auto ll = osmStore.nodes.at(relationNode);
+						geomp = Point(ll.lon, ll.latp);
+						centroidFound = true;
+						break;
+					}
+				}
+
+				if (relationNode != 0)
+					break;
+			}
+		}
+
+		if (!centroidFound)
+			geomp = calculateCentroid(algorithm);
+
+		// TODO: I think geom::is_empty always returns false for Points?
+		// See https://github.com/boostorg/geometry/blob/fa3623528ea27ba2c3c1327e4b67408a2b567038/include/boost/geometry/algorithms/is_empty.hpp#L103
 		if(geom::is_empty(geomp)) {
 			cerr << "Geometry is empty in OsmLuaProcessing::LayerAsCentroid (" << (isRelation ? "relation " : isWay ? "way " : "node ") << originalOsmID << ")" << endl;
 			return;
@@ -418,179 +790,297 @@ void OsmLuaProcessing::LayerAsCentroid(const string &layerName) {
 		if (verbose) cerr << "Problem geometry " << (isRelation ? "relation " : isWay ? "way " : "node " ) << originalOsmID << ": " << err.what() << endl;
 		return;
 	} catch (std::invalid_argument &err) {
-		cerr << "Error in OutputObjectOsmStore constructor for " << (isRelation ? "relation " : isWay ? "way " : "node " ) << originalOsmID << ": " << err.what() << endl;
+		cerr << "Error in OutputObject constructor for " << (isRelation ? "relation " : isWay ? "way " : "node " ) << originalOsmID << ": " << err.what() << endl;
 		return;
 	}
 
-	osmStore.store_point(osmStore.osm(), osmID, geomp);
-	OutputObjectRef oo = osmMemTiles.CreateObject(OutputObjectOsmStorePoint(POINT_,
-					layers.layerMap[layerName], osmID, attributeStore.empty_set(), layerMinZoom));
-	outputs.push_back(std::make_pair(oo, attributeStore.empty_set()));
+	NodeID id = 0;
+	// We don't do lazy geometries for centroids in these cases:
+	//
+	// - --materialize-geometries is set
+	// - the geometry is a relation - calculating their centroid can be quite expensive,
+	//   and there's not as many of them as there are ways
+	// - when the algorithm chosen is polylabel
+	//     We can extend lazy geometries to this, it just needs some fiddling to
+	//     express it in the ID and measure if there's a runtime impact in computing
+	//     the polylabel twice.
+	if (materializeGeometries || (isRelation && relationNode == 0) || (isWay && algorithm != CentroidAlgorithm::Centroid)) {
+		id = osmMemTiles.storePoint(geomp);
+	} else if (relationNode != 0) {
+		id = USE_NODE_STORE | relationNode;
+	} else if (!isRelation && !isWay) {
+		// Sometimes people call LayerAsCentroid(...) on a node, because they're
+		// writing a generic handler that doesn't know if it's a node or a way,
+		// e.g. POIs.
+		id = USE_NODE_STORE | originalOsmID;
+	} else {
+		id = USE_WAY_STORE | originalOsmID;
+		wayEmitted = true;
+	}
+	OutputObject oo(POINT_, layers.layerMap[layerName], id, 0, layerMinZoom);
+	outputs.push_back(std::make_pair(std::move(oo), attributes));
 }
 
-Point OsmLuaProcessing::calculateCentroid() {
+Point OsmLuaProcessing::calculateCentroid(CentroidAlgorithm algorithm) {
 	Point centroid;
 	if (isRelation) {
-		Geometry tmp;
-		tmp = osmStore.wayListMultiPolygon(
-			outerWayVecPtr->cbegin(), outerWayVecPtr->cend(), innerWayVecPtr->begin(), innerWayVecPtr->cend());
-		geom::centroid(tmp, centroid);
+		MultiPolygon tmp;
+		tmp = multiPolygonCached();
+
+		if (algorithm == CentroidAlgorithm::Polylabel) {
+			int index = 0;
+
+			// CONSIDER: pick precision intelligently
+			// Polylabel works on polygons, so for multipolygons we'll label the biggest outer.
+			double biggestSize = 0;
+			for (int i = 0; i < tmp.size(); i++) {
+				double size = geom::area(tmp[i]);
+				if (size > biggestSize) {
+					biggestSize = size;
+					index = i;
+				}
+			}
+
+			if (tmp.size() == 0)
+				throw geom::centroid_exception();
+			centroid = mapbox::polylabel(tmp[index]);
+		} else {
+			geom::centroid(tmp, centroid);
+		}
 		return Point(centroid.x()*10000000.0, centroid.y()*10000000.0);
 	} else if (isWay) {
 		Polygon p;
 		geom::assign_points(p, linestringCached());
-		geom::centroid(p, centroid);
+
+		if (algorithm == CentroidAlgorithm::Polylabel) {
+			// CONSIDER: pick precision intelligently
+			centroid = mapbox::polylabel(p);
+		} else {
+			geom::centroid(p, centroid);
+		}
 		return Point(centroid.x()*10000000.0, centroid.y()*10000000.0);
 	} else {
 		return Point(lon, latp);
 	}
 }
 
-std::vector<double> OsmLuaProcessing::Centroid() {
-	Point c = calculateCentroid();
-	return std::vector<double> { latp2lat(c.y()/10000000.0), c.x()/10000000.0 };
+OsmLuaProcessing::CentroidAlgorithm OsmLuaProcessing::parseCentroidAlgorithm(const std::string& algorithm) const {
+	if (algorithm == "polylabel") return OsmLuaProcessing::CentroidAlgorithm::Polylabel;
+	if (algorithm == "centroid") return OsmLuaProcessing::CentroidAlgorithm::Centroid;
+
+	throw std::runtime_error("unknown centroid algorithm " + algorithm);
+}
+
+kaguya::optional<std::vector<double>> OsmLuaProcessing::Centroid(kaguya::VariadicArgType algorithmArgs) {
+	CentroidAlgorithm algorithm = defaultCentroidAlgorithm();
+
+	for (auto needleRef : algorithmArgs) {
+		const std::string needle = needleRef.get<std::string>();
+		algorithm = parseCentroidAlgorithm(needle);
+		break;
+	}
+	try {
+		Point c = calculateCentroid(algorithm);
+		return std::vector<double> { latp2lat(c.y()/10000000.0), c.x()/10000000.0 };
+	} catch (geom::centroid_exception &err) {
+		if (verbose) cerr << "Problem geometry " << (isRelation ? "relation " : isWay ? "way " : "node " ) << originalOsmID << ": " << err.what() << endl;
+		return kaguya::optional<std::vector<double>>();
+	}
 }
 
 // Accept a relation in relation_scan phase
 void OsmLuaProcessing::Accept() {
 	relationAccepted = true;
 }
+// Set a tag in post-scan phase
+void OsmLuaProcessing::SetTag(const std::string &key, const std::string &value) {
+	if (!isPostScanRelation) throw std::runtime_error("SetTag can only be used in relation_postscan_function");
+	osmStore.scannedRelations.set_relation_tag(originalOsmID, key, value);
+}
+
+void OsmLuaProcessing::removeAttributeIfNeeded(const string& key) {
+	// Does it exist?
+	for (int i = 0; i < outputKeys.size(); i++) {
+		if (outputKeys[i] == key) {
+			AttributeSet& set = outputs.back().second;
+			set.removePairWithKey(attributeStore.pairStore, attributeStore.keyStore.key2index(key));
+			return;
+		}
+	}
+
+	outputKeys.push_back(key);
+}
 
 // Set attributes in a vector tile's Attributes table
-void OsmLuaProcessing::Attribute(const string &key, const string &val) { AttributeWithMinZoom(key,val,0); }
-void OsmLuaProcessing::AttributeWithMinZoom(const string &key, const string &val, const char minzoom) {
-	if (val.size()==0) { return; }		// don't set empty strings
+void OsmLuaProcessing::Attribute(const string &key, const protozero::data_view val, const char minzoom) {
 	if (outputs.size()==0) { ProcessingError("Can't add Attribute if no Layer set"); return; }
-	vector_tile::Tile_Value v;
-	v.set_string_value(val);
-	outputs.back().second->values.emplace(key, v, minzoom);
-	setVectorLayerMetadata(outputs.back().first->layer, key, 0);
+	removeAttributeIfNeeded(key);
+	attributeStore.addAttribute(outputs.back().second, key, val, minzoom);
+	setVectorLayerMetadata(outputs.back().first.layer, key, 0);
 }
 
-void OsmLuaProcessing::AttributeNumeric(const string &key, const float val) { AttributeNumericWithMinZoom(key,val,0); }
-void OsmLuaProcessing::AttributeNumericWithMinZoom(const string &key, const float val, const char minzoom) {
+void OsmLuaProcessing::AttributeNumeric(const string &key, const float val, const char minzoom) {
 	if (outputs.size()==0) { ProcessingError("Can't add Attribute if no Layer set"); return; }
-	vector_tile::Tile_Value v;
-	v.set_float_value(val);
-	outputs.back().second->values.emplace(key, v, minzoom);
-	setVectorLayerMetadata(outputs.back().first->layer, key, 1);
+	removeAttributeIfNeeded(key);
+	attributeStore.addAttribute(outputs.back().second, key, val, minzoom);
+	setVectorLayerMetadata(outputs.back().first.layer, key, 1);
 }
 
-void OsmLuaProcessing::AttributeBoolean(const string &key, const bool val) { AttributeBooleanWithMinZoom(key,val,0); }
-void OsmLuaProcessing::AttributeBooleanWithMinZoom(const string &key, const bool val, const char minzoom) {
+void OsmLuaProcessing::AttributeBoolean(const string &key, const bool val, const char minzoom) {
 	if (outputs.size()==0) { ProcessingError("Can't add Attribute if no Layer set"); return; }
-	vector_tile::Tile_Value v;
-	v.set_bool_value(val);
-	outputs.back().second->values.emplace(key, v, minzoom);
-	setVectorLayerMetadata(outputs.back().first->layer, key, 2);
-}
-
-template<typename T>
-static inline T make_valid(double v)
-{
-	if(!std::isfinite(v)) return 0;
-	return static_cast<T>(std::floor(v));
+	removeAttributeIfNeeded(key);
+	attributeStore.addAttribute(outputs.back().second, key, val, minzoom);
+	setVectorLayerMetadata(outputs.back().first.layer, key, 2);
 }
 
 // Set minimum zoom
 void OsmLuaProcessing::MinZoom(const double z) {
 	if (outputs.size()==0) { ProcessingError("Can't set minimum zoom if no Layer set"); return; }
-	outputs.back().first->setMinZoom(make_valid<unsigned int>(z));
+	outputs.back().first.setMinZoom(z);
 }
 
 // Set z_order
 void OsmLuaProcessing::ZOrder(const double z) {
 	if (outputs.size()==0) { ProcessingError("Can't set z_order if no Layer set"); return; }
-#ifdef FLOAT_Z_ORDER
-	outputs.back().first->setZOrder(make_valid<float>(z));
-#else
-	outputs.back().first->setZOrder(make_valid<int>(z));
-#endif
-}
-
-// Set z_order (variant with scaling)
-void OsmLuaProcessing::ZOrderWithScale(const double z, const double scale) {
-	if (outputs.size()==0) { ProcessingError("Can't set z_order if no Layer set"); return; }
-#ifdef FLOAT_Z_ORDER
-	outputs.back().first->setZOrder(make_valid<float>(z));
-#else
-	outputs.back().first->setZOrder(make_valid<int>(z/scale*127));
-#endif
+	outputs.back().first.setZOrder(z);
 }
 
 // Read scanned relations
-kaguya::optional<int> OsmLuaProcessing::NextRelation() {
+// Kaguya doesn't support optional<tuple<int,string>>, so we write a custom serializer
+// to either return nil or a tuple.
+template<>  struct kaguya::lua_type_traits<OsmLuaProcessing::OptionalRelation> {
+	typedef OsmLuaProcessing::OptionalRelation get_type;
+	typedef const OsmLuaProcessing::OptionalRelation& push_type;
+
+	static bool strictCheckType(lua_State* l, int index)
+	{
+		throw std::runtime_error("Lua code doesn't know how to send OptionalRelation");
+	}
+	static bool checkType(lua_State* l, int index)
+	{
+		throw std::runtime_error("Lua code doesn't know how to send OptionalRelation");
+	}
+	static get_type get(lua_State* l, int index)
+	{
+		throw std::runtime_error("Lua code doesn't know how to send OptionalRelation");
+	}
+	static int push(lua_State* l, push_type s)
+	{
+		if (s.done)
+			return 0;
+
+		lua_pushinteger(l, s.id);
+		lua_pushlstring(l, s.role.data(), s.role.size());
+		return 2;
+	}
+};
+
+OsmLuaProcessing::OptionalRelation OsmLuaProcessing::NextRelation() {
 	relationSubscript++;
-	if (relationSubscript >= relationList.size()) return kaguya::nullopt_t();
-	return relationList[relationSubscript];
+	if (relationSubscript >= relationList.size()) return { true };
+
+	return {
+		false,
+		static_cast<lua_Integer>(relationList[relationSubscript].first),
+		osmStore.scannedRelations.getRole(relationList[relationSubscript].second)
+	};
+}
+
+void OsmLuaProcessing::RestartRelations() {
+	relationSubscript = -1;
 }
 
 std::string OsmLuaProcessing::FindInRelation(const std::string &key) {
-	return osmStore.get_relation_tag(relationList[relationSubscript], key);
+	return osmStore.scannedRelations.get_relation_tag(relationList[relationSubscript].first, key);
 }
 
 // Record attribute name/type for vector_layers table
 void OsmLuaProcessing::setVectorLayerMetadata(const uint_least8_t layer, const string &key, const uint type) {
+	std::lock_guard<std::mutex> lock(vectorLayerMetadataMutex);
 	layers.layers[layer].attributeMap[key] = type;
 }
 
 // Scan relation (but don't write geometry)
 // return true if we want it, false if we don't
-bool OsmLuaProcessing::scanRelation(WayID id, const tag_map_t &tags) {
+bool OsmLuaProcessing::scanRelation(WayID id, const TagMap& tags) {
 	reset();
 	originalOsmID = id;
-	isWay = false;
 	isRelation = true;
-	currentTags = tags;
-	luaState["relation_scan_function"](this);
+	currentTags = &tags;
+	try {
+		luaState["relation_scan_function"]();
+	} catch(luaProcessingException &e) {
+		std::cerr << "Lua error on scanning relation " << originalOsmID << std::endl;
+		exit(1);
+	}
 	if (!relationAccepted) return false;
 	
-	osmStore.store_relation_tags(id, tags);
+	// If we're persisting, we need to make a real map that owns its
+	// own keys and values.
+	osmStore.scannedRelations.store_relation_tags(id, tags.exportToBoostMap());
 	return true;
 }
 
-void OsmLuaProcessing::setNode(NodeID id, LatpLon node, const tag_map_t &tags) {
+// Post-scan relations - typically used for bouncing down values from nested relations
+void OsmLuaProcessing::postScanRelations() {
+	if (!supportsPostScanRelations) return;
 
+	for (const auto &relp : osmStore.scannedRelations.relationsForRelations) {
+		reset();
+		isPostScanRelation = true;
+		RelationID id = relp.first;
+		originalOsmID = id;
+		currentPostScanTags = &(osmStore.scannedRelations.relation_tags(id));
+		relationList = osmStore.scannedRelations.relations_for_relation_with_parents(id);
+		luaState["relation_postscan_function"](this);
+	}
+}
+
+bool OsmLuaProcessing::setNode(NodeID id, LatpLon node, const TagMap& tags) {
 	reset();
-	osmID = (id & OSMID_MASK) | OSMID_NODE;
 	originalOsmID = id;
-	isWay = false;
-	isRelation = false;
 	lon = node.lon;
 	latp= node.latp;
-	currentTags = tags;
+	currentTags = &tags;
+
+	if (supportsReadingRelations && osmStore.scannedRelations.node_in_any_relations(id)) {
+		relationList = osmStore.scannedRelations.relations_for_node(id);
+	}
 
 	//Start Lua processing for node
-	luaState["node_function"](this);
+	try {
+		luaState["node_function"]();
+	} catch(luaProcessingException &e) {
+		std::cerr << "Lua error on node " << originalOsmID << std::endl;
+		exit(1);
+	}
 
 	if (!this->empty()) {
-		TileCoordinates index = latpLon2index(node, this->config.baseZoom);
+		TileCoordinates index = latpLon2index(node, osmMemTiles.getIndexZoom());
 
-		for (auto jt = this->outputs.begin(); jt != this->outputs.end(); ++jt) {
-			// Store the attributes of the generated geometry
-			jt->first->setAttributeSet(attributeStore.store_set(jt->second));		
-
-			osmMemTiles.AddObject(index, jt->first);
+		for (auto &output : finalizeOutputs()) {
+			osmMemTiles.addObjectToSmallIndex(index, output, originalOsmID);
 		}
-	} 
+
+		return true;
+	}
+
+	return false;
 }
 
 // We are now processing a way
-void OsmLuaProcessing::setWay(WayID wayId, LatpLonVec const &llVec, const tag_map_t &tags) {
+bool OsmLuaProcessing::setWay(WayID wayId, LatpLonVec const &llVec, const TagMap& tags) {
 	reset();
-	osmID = (wayId & OSMID_MASK) | OSMID_WAY;
+	wayEmitted = false;
 	originalOsmID = wayId;
 	isWay = true;
-	isRelation = false;
 	llVecPtr = &llVec;
 	outerWayVecPtr = nullptr;
 	innerWayVecPtr = nullptr;
 	linestringInited = polygonInited = multiPolygonInited = false;
 
-	if (supportsReadingRelations && osmStore.way_in_any_relations(wayId)) {
-		relationList = osmStore.relations_for_way(wayId);
-	} else {
-		relationList.clear();
+	if (supportsReadingRelations && osmStore.scannedRelations.way_in_any_relations(wayId)) {
+		relationList = osmStore.scannedRelations.relations_for_way(wayId);
 	}
 
 	try {
@@ -602,84 +1092,43 @@ void OsmLuaProcessing::setWay(WayID wayId, LatpLonVec const &llVec, const tag_ma
 		throw std::out_of_range(ss.str());
 	}
 
-	currentTags = tags;
+	currentTags = &tags;
 
 	bool ok = true;
 	if (ok) {
-		luaState.setErrorHandler(kaguya::ErrorHandler::throwDefaultError);
-
 		//Start Lua processing for way
-		kaguya::LuaFunction way_function = luaState["way_function"];
-		kaguya::LuaRef ret = way_function(this);
-		assert(!ret);
+		try {
+			kaguya::LuaFunction way_function = luaState["way_function"];
+			kaguya::LuaRef ret = way_function();
+			assert(!ret);
+		} catch(luaProcessingException &e) {
+			std::cerr << "Lua error on way " << originalOsmID << std::endl;
+			exit(1);
+		}
 	}
 
 	if (!this->empty()) {
-		for (auto jt = this->outputs.begin(); jt != this->outputs.end(); ++jt) {
-			// Store the attributes of the generated geometry
-			jt->first->setAttributeSet(attributeStore.store_set(jt->second));		
-		}
-
-		// create a list of tiles this way passes through (tileSet)
-		unordered_set<TileCoordinates> tileSet;
-		try {
-			Linestring ls = osmStore.llListLinestring(llVecPtr->cbegin(),llVecPtr->cend());
-			insertIntermediateTiles(ls, this->config.baseZoom, tileSet);
-
-			// then, for each tile, store the OutputObject for each layer
-			bool polygonExists = false;
-			TileCoordinate minTileX = TILE_COORDINATE_MAX, maxTileX = 0, minTileY = TILE_COORDINATE_MAX, maxTileY = 0;
-			for (auto it = tileSet.begin(); it != tileSet.end(); ++it) {
-				TileCoordinates index = *it;
-				minTileX = std::min(index.x, minTileX);
-				minTileY = std::min(index.y, minTileY);
-				maxTileX = std::max(index.x, maxTileX);
-				maxTileY = std::max(index.y, maxTileY);
-				for (auto jt = this->outputs.begin(); jt != this->outputs.end(); ++jt) {
-					if (jt->first->geomType == POLYGON_) {
-						polygonExists = true;
-						continue;
-					}
-					osmMemTiles.AddObject(index, jt->first); // not a polygon
-				}
-			}
-
-			// for polygon, fill inner tiles
-			if (polygonExists) {
-				bool tilesetFilled = false;
-				uint size = (maxTileX - minTileX + 1) * (maxTileY - minTileY + 1);
-				for (auto jt = this->outputs.begin(); jt != this->outputs.end(); ++jt) {
-					if (jt->first->geomType != POLYGON_) continue;
-					if (size>= 16) {
-						// Larger objects - add to rtree
-						Box box = Box(geom::make<Point>(minTileX, minTileY),
-						              geom::make<Point>(maxTileX, maxTileY));
-						osmMemTiles.AddObjectToLargeIndex(box, jt->first);
-					} else {
-						// Smaller objects - add to each individual tile index
-						if (!tilesetFilled) { fillCoveredTiles(tileSet); tilesetFilled = true; }
-						for (auto it = tileSet.begin(); it != tileSet.end(); ++it) {
-							TileCoordinates index = *it;
-							osmMemTiles.AddObject(index, jt->first);
-						}
-					}
-				}
-			}
-		} catch(std::out_of_range &err) {
-			cerr << "Error calculating intermediate tiles: " << err.what() << endl;
-		}
+		osmMemTiles.addGeometryToIndex(linestringCached(), finalizeOutputs(), originalOsmID);
+		return wayEmitted;
 	}
+
+	return false;
 }
 
 // We are now processing a relation
-// (note that we store relations as ways with artificial IDs, and that
-//  we use decrementing positive IDs to give a bit more space for way IDs)
-void OsmLuaProcessing::setRelation(int64_t relationId, WayVec const &outerWayVec, WayVec const &innerWayVec, const tag_map_t &tags, 
-                                   bool isNativeMP,      // only OSM type=multipolygon
-                                   bool isInnerOuter) {  // any OSM relation with "inner" and "outer" roles (e.g. type=multipolygon|boundary)
+void OsmLuaProcessing::setRelation(
+	const std::vector<protozero::data_view>& stringTable,
+	const PbfReader::Relation& relation,
+	const WayVec& outerWayVec,
+	const WayVec& innerWayVec,
+	const TagMap& tags,
+	bool isNativeMP, // only OSM type=multipolygon
+	bool isInnerOuter // any OSM relation with "inner" and "outer" roles (e.g. type=multipolygon|boundary)
+) {
 	reset();
-	osmID = (relationId & OSMID_MASK) | OSMID_RELATION;
-	originalOsmID = relationId;
+	this->stringTable = &stringTable;
+	currentRelation = &relation;
+	originalOsmID = relation.id;
 	isWay = true;
 	isRelation = true;
 	isClosed = isNativeMP || isInnerOuter;
@@ -687,97 +1136,62 @@ void OsmLuaProcessing::setRelation(int64_t relationId, WayVec const &outerWayVec
 	llVecPtr = nullptr;
 	outerWayVecPtr = &outerWayVec;
 	innerWayVecPtr = &innerWayVec;
-	currentTags = tags;
+	currentTags = &tags;
+
+	if (supportsReadingRelations && osmStore.scannedRelations.relation_in_any_relations(originalOsmID)) {
+		relationList = osmStore.scannedRelations.relations_for_relation(originalOsmID);
+	}
 
 	// Start Lua processing for relation
 	if (!isNativeMP && !supportsWritingRelations) return;
-	luaState[isNativeMP ? "way_function" : "relation_function"](this);
+	try {
+		if (isNativeMP && supportsWritingWays)
+			luaState["way_function"]();
+		else if (!isNativeMP && supportsWritingRelations)
+			luaState["relation_function"]();
+	} catch(luaProcessingException &e) {
+		std::cerr << "Lua error on relation " << originalOsmID << std::endl;
+		exit(1);
+	}
 	if (this->empty()) return;
 
-	// Assemble multipolygon
-	if (isClosed) {
-		MultiPolygon mp;
-		try {
-			// for each tile the relation may cover, put the output objects.
-			mp = osmStore.wayListMultiPolygon(outerWayVecPtr->cbegin(), outerWayVecPtr->cend(), innerWayVecPtr->cbegin(), innerWayVecPtr->cend());
-		} catch(std::out_of_range &err) {
-			cout << "In relation " << originalOsmID << ": " << err.what() << endl;
-			return;
-		}		
+	try {
+		if (isClosed) {
+			std::vector<OutputObject> objects = finalizeOutputs();
+			osmMemTiles.addGeometryToIndex(multiPolygonCached(), objects, originalOsmID);
+		} else {
+			osmMemTiles.addGeometryToIndex(multiLinestringCached(), finalizeOutputs(), originalOsmID);
+		}
+	} catch(std::out_of_range &err) {
+		cout << "In relation " << originalOsmID << ": " << err.what() << endl;
+	}		
+}
 
-		for (auto jt = this->outputs.begin(); jt != this->outputs.end(); ++jt) {
-			// Store the attributes of the generated geometry
-			jt->first->setAttributeSet(attributeStore.store_set(jt->second));		
-		}
-
-		unordered_set<TileCoordinates> tileSet;
-		bool singleOuter = mp.size()==1;
-		for (Polygon poly: mp) {
-			unordered_set<TileCoordinates> tileSetTmp;
-			insertIntermediateTiles(poly.outer(), this->config.baseZoom, tileSetTmp);
-			fillCoveredTiles(tileSetTmp);
-			if (singleOuter) {
-				tileSet = std::move(tileSetTmp);
-			} else {
-				tileSet.insert(tileSetTmp.begin(), tileSetTmp.end());
-			}
-		}
-		
-		TileCoordinate minTileX = TILE_COORDINATE_MAX, maxTileX = 0, minTileY = TILE_COORDINATE_MAX, maxTileY = 0;
-		for (auto it = tileSet.begin(); it != tileSet.end(); ++it) {
-			TileCoordinates index = *it;
-			minTileX = std::min(index.x, minTileX);
-			minTileY = std::min(index.y, minTileY);
-			maxTileX = std::max(index.x, maxTileX);
-			maxTileY = std::max(index.y, maxTileY);
-		}
-		for (auto jt = this->outputs.begin(); jt != this->outputs.end(); ++jt) {
-			if (tileSet.size()>=16) {
-				// Larger objects - add to rtree
-				// note that the bbox is currently the envelope of the entire multipolygon,
-				// which is suboptimal in shapes like (_) ...... (_) where the outers are significantly disjoint
-				Box box = Box(geom::make<Point>(minTileX, minTileY),
-				              geom::make<Point>(maxTileX, maxTileY));
-				osmMemTiles.AddObjectToLargeIndex(box, jt->first);
-			} else {
-				// Smaller objects - add to each individual tile index
-				for (auto it = tileSet.begin(); it != tileSet.end(); ++it) {
-					TileCoordinates index = *it;
-					osmMemTiles.AddObject(index, jt->first);
-				}
-			}
-		}
-
-	// Assemble multilinestring
-	} else {
-		MultiLinestring mls;
-		try {
-			mls = osmStore.wayListMultiLinestring(outerWayVecPtr->cbegin(), outerWayVecPtr->cend());
-		} catch(std::out_of_range &err) {
-			cout << "In relation " << originalOsmID << ": " << err.what() << endl;
-			return;
-		}
-
-		// Store attributes
-		for (auto jt = this->outputs.begin(); jt != this->outputs.end(); ++jt) {
-			jt->first->setAttributeSet(attributeStore.store_set(jt->second));		
-		}
-
-		// Calculate tileset and then insert outputobject for each one
-		for (Linestring ls : mls) {
-			unordered_set<TileCoordinates> tileSet;
-			insertIntermediateTiles(ls, this->config.baseZoom, tileSet);
-			for (auto it = tileSet.begin(); it != tileSet.end(); ++it) {
-				TileCoordinates index = *it;
-				for (auto jt = this->outputs.begin(); jt != this->outputs.end(); ++jt) {
-					osmMemTiles.AddObject(index, jt->first);
-				}
-			}
-		}
+SignificantTags OsmLuaProcessing::GetSignificantNodeKeys() {
+	if (!!luaState["node_keys"]) {
+		std::vector<string> keys = luaState["node_keys"];
+		return SignificantTags(keys);
 	}
+
+	return SignificantTags();
 }
 
-vector<string> OsmLuaProcessing::GetSignificantNodeKeys() {
-	return luaState["node_keys"];
+SignificantTags OsmLuaProcessing::GetSignificantWayKeys() {
+	if (!!luaState["way_keys"]) {
+		std::vector<string> keys = luaState["way_keys"];
+		return SignificantTags(keys);
+	}
+
+	return SignificantTags();
 }
 
+
+std::vector<OutputObject> OsmLuaProcessing::finalizeOutputs() {
+	std::vector<OutputObject> list;
+	list.reserve(this->outputs.size());
+	for (auto jt = this->outputs.begin(); jt != this->outputs.end(); ++jt) {
+		jt->first.setAttributeSet(attributeStore.add(jt->second));
+		list.push_back(jt->first);
+	}
+	return list;
+}

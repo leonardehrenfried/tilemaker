@@ -2,146 +2,433 @@
 #ifndef _ATTRIBUTE_STORE_H
 #define _ATTRIBUTE_STORE_H
 
-#include "vector_tile.pb.h"
-#include <boost/functional/hash.hpp>
-#include <boost/intrusive_ptr.hpp>
 #include <mutex>
+#include <deque>
+#include <map>
+#include <iostream>
 #include <atomic>
+#include <boost/functional/hash.hpp>
+#include <boost/container/flat_map.hpp>
+#include <vector>
+#include <protozero/data_view.hpp>
+#include "pooled_string.h"
+#include "deque_map.h"
 
-/*	AttributeStore 
- *	global dictionaries for attributes
- *	We combine all similair keys/values pairs and sets
- *	- All the same key/value pairs are combined in key_values
- *	- All the same set of key/values are combined in set_list
- *
- *	Every key/value set gets an ID in set_list. If the ID of two attribute sets are the same
- *	this means these objects share the same set of attribute/values. Output objects store a 
- *	reference to the set of paremeters in set_list. 
-*/
+/* AttributeStore - global dictionary for attributes */
 
-struct AttributeStore
-{
-	struct kv_with_minzoom {
-		std::string key;
-		vector_tile::Tile_Value value;
-		char minzoom;
+typedef uint32_t AttributeIndex; // check this is enough
 
-		kv_with_minzoom(std::string const &key, vector_tile::Tile_Value const &value, char minzoom)
-			: key(key), value(value), minzoom(minzoom)
-		{ }  
+struct string_ptr_less_than {
+	bool operator()(const std::string* lhs, const std::string* rhs) const {            
+		return *lhs < *rhs;
+	}
+}; 
+
+class AttributeKeyStore {
+public:
+	AttributeKeyStore(): finalized(false), keys2indexSize(0) {}
+	uint16_t key2index(const std::string& key);
+	const std::string& getKey(uint16_t index) const;
+	const std::string& getKeyUnsafe(uint16_t index) const;
+	void finalize() { finalized = true; }
+	std::atomic<uint32_t> keys2indexSize;
+
+private:
+	bool finalized;
+	mutable std::mutex keys2indexMutex;
+	// NB: we use a deque, not a vector, because a deque never invalidates
+	// pointers to its members as long as you only push_back
+	std::deque<std::string> keys;
+	std::map<const std::string*, uint16_t, string_ptr_less_than> keys2index;
+};
+
+enum class AttributePairType: uint8_t { String = 0, Float = 1, Bool = 2 };
+// AttributePair is a key/value pair (with minzoom)
+#pragma pack(push, 1)
+struct AttributePair {
+	unsigned short keyIndex : 9;
+	AttributePairType valueType : 2;
+	uint8_t minzoom : 5; // Support zooms from 0..31. In practice, we expect z16 to be the biggest minzoom.
+	union {
+		float floatValue_;
+		PooledString stringValue_;
 	};
 
-	enum class Index { BOOL, FLOAT, STRING };
-
-	static Index type_index(vector_tile::Tile_Value const &v)
+	AttributePair(uint32_t keyIndex, bool value, char minzoom)
+		: keyIndex(keyIndex), valueType(AttributePairType::Bool), minzoom(minzoom), floatValue_(value ? 1 : 0)
 	{
-		if(v.has_string_value())
-			return Index::STRING;
-		else if(v.has_float_value())
-			return Index::FLOAT;
-		else
-			return Index::BOOL;
+	}
+	AttributePair(uint32_t keyIndex, const PooledString& value, char minzoom)
+		: keyIndex(keyIndex), valueType(AttributePairType::String), stringValue_(value), minzoom(minzoom)
+	{
+	}
+	AttributePair(uint32_t keyIndex, float value, char minzoom)
+		: keyIndex(keyIndex), valueType(AttributePairType::Float), minzoom(minzoom), floatValue_(value)
+	{
 	}
 
-	static bool compare(vector_tile::Tile_Value const &lhs, vector_tile::Tile_Value const &rhs) {
-		auto lhs_id = type_index(lhs);
-		auto rhs_id = type_index(lhs);
-
-		if(lhs_id < rhs_id)
-			return true;
-		if(lhs_id > rhs_id)
-			return false;
-
-		switch(lhs_id) {
-			case Index::BOOL:
-				return lhs.bool_value() < rhs.bool_value();
-			case Index::FLOAT:	
-				return lhs.float_value() < rhs.float_value();
-			case Index::STRING:	
-				return lhs.string_value() < rhs.string_value();
+	AttributePair(const AttributePair& other):
+		keyIndex(other.keyIndex), valueType(other.valueType), minzoom(other.minzoom)
+	{
+		if (valueType == AttributePairType::Bool || valueType == AttributePairType::Float) {
+			floatValue_ = other.floatValue_;
+			return;
 		}
 
+		stringValue_ = other.stringValue_;
+	}
+
+	AttributePair& operator=(const AttributePair& other) {
+		keyIndex = other.keyIndex;
+		valueType = other.valueType;
+		minzoom = other.minzoom;
+
+		if (valueType == AttributePairType::Bool || valueType == AttributePairType::Float) {
+			floatValue_ = other.floatValue_;
+			return *this;
+		}
+
+		stringValue_ = other.stringValue_;
+		return *this;
+	}
+
+	bool operator<(const AttributePair& other) const {
+		if (minzoom != other.minzoom)
+			return minzoom < other.minzoom;
+		if (keyIndex != other.keyIndex)
+			return keyIndex < other.keyIndex;
+		if (valueType != other.valueType) return valueType < other.valueType;
+
+		if (hasStringValue()) return pooledString() < other.pooledString();
+		if (hasBoolValue()) return boolValue() < other.boolValue();
+		if (hasFloatValue()) return floatValue() < other.floatValue();
 		throw std::runtime_error("Invalid type in attribute store");
 	}
-    
-    struct key_value_less {
-        bool operator()(kv_with_minzoom const &lhs, kv_with_minzoom const& rhs) const {            
-			return (lhs.minzoom != rhs.minzoom) ? (lhs.minzoom < rhs.minzoom)
-			     : (lhs.key != rhs.key) ? (lhs.key < rhs.key)
-			     : compare(lhs.value, rhs.value);
-        }
-    }; 
 
-	struct key_value_set {
-		std::set<kv_with_minzoom, key_value_less> values;
-		mutable std::atomic<uint64_t> references;
+	bool operator==(const AttributePair &other) const {
+		if (minzoom!=other.minzoom || keyIndex!=other.keyIndex || valueType!=other.valueType) return false;
+		if (valueType == AttributePairType::String)
+			return stringValue_ == other.stringValue_;
 
-		key_value_set() 
-			: references(0)
-		{ }
+		if (valueType == AttributePairType::Float || valueType == AttributePairType::Bool)
+			return floatValue_ == other.floatValue_;
+
+		return true;
+	}
+
+	bool hasStringValue() const { return valueType == AttributePairType::String; }
+	bool hasFloatValue() const { return valueType == AttributePairType::Float; }
+	bool hasBoolValue() const { return valueType == AttributePairType::Bool; }
+
+	const PooledString& pooledString() const { return stringValue_; }
+	const std::string stringValue() const { return stringValue_.toString(); }
+	float floatValue() const { return floatValue_; }
+	bool boolValue() const { return floatValue_; }
+
+	void ensureStringIsOwned();
+
+	static bool isHot(const std::string& keyName, const protozero::data_view value) {
+		// Is this pair a candidate for the hot pool?
+
+		// Hot pairs are pairs that we think are likely to be re-used, like
+		// tunnel=0, highway=yes, and so on.
+		//
+		// The trick is that we commit to putting them in the hot pool
+		// before we know if we were right.
+
+		// The rules for floats/booleans are managed in their addAttribute call.
+
+		// Only strings that are IDish are eligible: only lowercase letters.
+		bool ok = true;
+		for (size_t i = 0; i < value.size(); i++) {
+			const auto c = value.data()[i];
+			if (c != '-' && c != '_' && (c < 'a' || c > 'z'))
+				return false;
+		}
+
+		// Keys that sound like name, name:en, etc, aren't eligible.
+		if (keyName.size() >= 4 && keyName[0] == 'n' && keyName[1] == 'a' && keyName[2] == 'm' && keyName[3])
+			return false;
+
+		return true;
+	}
+
+	size_t hash() const {
+		std::size_t rv = minzoom;
+		boost::hash_combine(rv, keyIndex);
+		boost::hash_combine(rv, valueType);
+
+		if(hasStringValue()) {
+			const char* data = pooledString().data();
+			boost::hash_range(rv, data, data + pooledString().size());
+		} else if(hasFloatValue())
+			boost::hash_combine(rv, floatValue());
+		else if(hasBoolValue())
+			boost::hash_combine(rv, boolValue());
+		else {
+			throw new std::out_of_range("cannot hash pair, unknown value");
+		}
+
+		return rv;
+	}
+};
+#pragma pack(pop)
+
+
+// We shard the cold pools to reduce the odds of lock contention on
+// inserting/retrieving the "cold" pairs.
+//
+// It should be at least 2x the number of your cores -- 256 shards is probably
+// reasonable for most people.
+//
+// We also reserve the bottom shard for the hot pool.
+#define SHARD_BITS 14
+#define ATTRIBUTE_SHARDS (1 << SHARD_BITS)
+
+class AttributeStore;
+class AttributePairStore {
+public:
+	AttributePairStore():
+		finalized(false),
+		pairsMutex(ATTRIBUTE_SHARDS),
+		lookups(0),
+		lookupsUncached(0)
+	{
+		// The "hot" shard has a capacity of 64K, the others are unbounded.
+		pairs.push_back(DequeMap<AttributePair>(1 << 16));
+		// Reserve offset 0 as a sentinel
+		pairs[0].add(AttributePair(0, false, 0));
+		for (size_t i = 1; i < ATTRIBUTE_SHARDS; i++)
+			pairs.push_back(DequeMap<AttributePair>());
+	}
+
+	void finalize() { finalized = true; }
+	const AttributePair& getPair(uint32_t i) const;
+	const AttributePair& getPairUnsafe(uint32_t i) const;
+	uint32_t addPair(AttributePair& pair, bool isHot);
+
+
+private:
+	friend class AttributeStore;
+	std::vector<DequeMap<AttributePair>> pairs;
+	bool finalized;
+	// We refer to all attribute pairs by index.
+	//
+	// Each shard is responsible for a portion of the key space.
+	// 
+	// The 0th shard is special: it's the hot shard, for pairs
+	// we suspect will be popular. It only ever has 64KB items,
+	// so that we can reference it with a short.
+	mutable std::vector<std::mutex> pairsMutex;
+	std::atomic<uint64_t> lookupsUncached;
+	std::atomic<uint64_t> lookups;
+};
+
+// AttributeSet is a set of AttributePairs
+// = the complete attributes for one object
+struct AttributeSet {
+
+	bool operator<(const AttributeSet& other) const {
+		if (useVector != other.useVector)
+			return useVector < other.useVector;
+
+		if (useVector) {
+			if (intValues.size() != other.intValues.size())
+				return intValues.size() < other.intValues.size();
+
+			for (int i = 0; i < intValues.size(); i++) {
+				if (intValues[i] != other.intValues[i]) {
+					return intValues[i] < other.intValues[i];
+				}
+			}
+
+			return false;
+		}
+
+		for (int i = 0; i < sizeof(shortValues)/sizeof(shortValues[0]); i++) {
+			if (shortValues[i] != other.shortValues[i]) {
+				return shortValues[i] < other.shortValues[i];
+			}
+		}
+
+		return false;
+	}
+
+	size_t hash() const {
+		// Values are in canonical form after finalizeSet is called, so
+		// can hash them in the order they're stored.
+		if (useVector) {
+			const size_t n = intValues.size();
+			size_t idx = n;
+			for (int i = 0; i < n; i++)
+				boost::hash_combine(idx, intValues[i]);
+
+			return idx;
+		}
+
+		size_t idx = 0;
+		for (int i = 0; i < sizeof(shortValues)/sizeof(shortValues[0]); i++)
+			boost::hash_combine(idx, shortValues[i]);
+
+		return idx;
+	}
+
+	bool operator!=(const AttributeSet& other) const { return !(*this == other); }
+	bool operator==(const AttributeSet &other) const {
+		// Equivalent if, for every value in values, there is a value in other.values
+		// whose pair is the same.
+		//
+		// NB: finalizeSet ensures values are in canonical order, so we can just
+		// do a pairwise comparison.
+
+		if (useVector != other.useVector)
+			return false;
+
+		if (useVector) {
+			const size_t n = intValues.size();
+			const size_t otherN = other.intValues.size();
+			if (n != otherN)
+				return false;
+			for (size_t i = 0; i < n; i++)
+				if (intValues[i] != other.intValues[i])
+					return false;
+
+			return true;
+		}
+
+		return memcmp(shortValues, other.shortValues, sizeof(shortValues)) == 0;
+	}
+
+	void finalize();
+
+	// We store references to AttributePairs either in an array of shorts
+	// or a vector of 32-bit ints.
+	//
+	// The array of shorts is not _really_ an array of shorts. It's meant
+	// to be interpreted as 4 shorts, and then 4 ints.
+	bool useVector;
+	union {
+		short shortValues[12];
+		std::vector<uint32_t> intValues;
 	};
 
-	using key_value_set_ref_t = boost::intrusive_ptr<key_value_set>;
+	size_t numPairs() const {
+		if (useVector)
+			return intValues.size();
 
-    struct key_value_set_store_less {
-        bool operator()(key_value_set_ref_t const &lhs, key_value_set_ref_t const &rhs) const {  
-            if(lhs->values.size() < rhs->values.size()) return true;
-            if(lhs->values.size() > rhs->values.size()) return false;
-            
-            key_value_less compare;
-            for(auto i = lhs->values.begin(), j = rhs->values.begin(); i != lhs->values.end(); ++i, ++j) {
-                if(compare(*i, *j)) return true;
-                if(compare(*j, *i)) return false;
-            }
-            
-            return false;            
-        }
-    };     
+		size_t rv = 0;
+		for (int i = 0; i < 8; i++)
+			if (isSet(i))
+				rv++;
 
-    using key_value_set_t = std::set<key_value_set_ref_t, key_value_set_store_less>;
+		return rv;
+	}
 
-	using key_value_index_t = std::pair<Index, char>; 
-	using key_value_map_t = std::vector< std::pair<std::mutex, key_value_set_t> >;
+	const uint32_t getPair(size_t i) const {
+		if (useVector)
+			return intValues[i];
 
-	key_value_map_t set_list;
+		size_t j = 0;
+		size_t actualIndex = 0;
+		// Advance actualIndex to the first non-zero entry, e.g. if
+		// the first thing added has a 4-byte index, our first entry
+		// is at location 4, not 0.
+		while(!isSet(actualIndex)) actualIndex++;
 
-	AttributeStore(unsigned int threadNum) 
-		: set_list(threadNum * threadNum)
-	{ }
+		while (j < i) {
+			j++;
+			actualIndex++;
+			while(!isSet(actualIndex)) actualIndex++;
+		}
 
-	key_value_set_ref_t empty_set() const { return new key_value_set(); }
+		return getValueAtIndex(actualIndex);
+	}
 
-    key_value_set_ref_t store_set(key_value_set_ref_t attributes) {
-		auto idx = attributes->values.size();
-		for(auto const &i: attributes->values) {
-			boost::hash_combine(idx, i.minzoom);
-			boost::hash_combine(idx, i.key);
-			boost::hash_combine(idx, type_index(i.value));
+	AttributeSet(): useVector(false) {
+		for (int i = 0; i < sizeof(shortValues)/sizeof(shortValues[0]); i++)
+			shortValues[i] = 0;
+	}
+	AttributeSet(const AttributeSet &&a) = delete;
 
-			if(i.value.has_string_value())
-				boost::hash_combine(idx, i.value.string_value());
-			else if(i.value.has_float_value())
-				boost::hash_combine(idx, i.value.float_value());
-			else
-				boost::hash_combine(idx, i.value.bool_value());
-		} 
-		
-		std::lock_guard<std::mutex> lock(set_list[idx % set_list.size()].first);
-		return *set_list[idx % set_list.size()].second.insert(attributes).first;	
+	AttributeSet(const AttributeSet &a) {
+		useVector = a.useVector;
+
+		if (useVector) {
+			new (&intValues) std::vector<uint32_t>;
+			intValues = a.intValues;
+		} else {
+			for (int i = 0; i < sizeof(shortValues)/sizeof(shortValues[0]); i++)
+				shortValues[i] = a.shortValues[i];
+		}
+	}
+
+	~AttributeSet() {
+		if (useVector)
+			intValues.~vector();
+	}
+
+	void addPair(uint32_t index);
+	void removePairWithKey(const AttributePairStore& pairStore, uint32_t keyIndex);
+private:
+	void setValueAtIndex(size_t index, uint32_t value) {
+		if (useVector) {
+			throw std::out_of_range("setValueAtIndex called for useVector=true");
+		}
+
+		if (index < 4 && value < (1 << 16)) {
+			shortValues[index] = (uint16_t)value;
+		} else if (index >= 4 && index < 8) {
+			((uint32_t*)(&shortValues[4]))[index - 4] = value;
+		} else {
+			throw std::out_of_range("setValueAtIndex out of bounds");
+		}
+	}
+	uint32_t getValueAtIndex(size_t index) const {
+		if (index < 4)
+			return shortValues[index];
+
+		return ((uint32_t*)(&shortValues[4]))[index - 4];
+	}
+	bool isSet(size_t index) const {
+		if (index < 4) return shortValues[index] != 0;
+
+		const size_t newIndex = 4 + 2 * (index - 4);
+		return shortValues[newIndex] != 0 || shortValues[newIndex + 1] != 0;
 	}
 };
 
-static inline void intrusive_ptr_add_ref(AttributeStore::key_value_set *kv_set){
-	auto result = kv_set->references.fetch_add(1, std::memory_order_relaxed);
-}
+// AttributeStore is the store for all AttributeSets
+struct AttributeStore {
+	AttributeIndex add(AttributeSet &attributes);
+	std::vector<const AttributePair*> getUnsafe(AttributeIndex index) const;
+	void reset(); // used for testing
+	size_t size() const;
+	void reportSize() const;
+	void finalize();
 
-static inline void intrusive_ptr_release(AttributeStore::key_value_set *kv_set) {
-	if (kv_set->references.fetch_sub(1, std::memory_order_release) == 1) {
-      std::atomic_thread_fence(std::memory_order_acquire);
-      delete kv_set;
-    }
-}
+	void addAttribute(AttributeSet& attributeSet, std::string const &key, const protozero::data_view v, char minzoom);
+	void addAttribute(AttributeSet& attributeSet, std::string const &key, float v, char minzoom);
+	void addAttribute(AttributeSet& attributeSet, std::string const &key, bool v, char minzoom);
+	
+	AttributeStore():
+		finalized(false),
+		sets(ATTRIBUTE_SHARDS),
+		setsMutex(ATTRIBUTE_SHARDS),
+		lookups(0),
+		lookupsUncached(0) {
+	}
 
-using AttributeStoreRef = AttributeStore::key_value_set_ref_t;
+	AttributeKeyStore keyStore;
+	AttributePairStore pairStore;
 
-#endif //_COORDINATES_H
+private:
+	bool finalized;
+	std::vector<DequeMap<AttributeSet>> sets;
+	mutable std::vector<std::mutex> setsMutex;
+
+	mutable std::mutex mutex;
+	std::atomic<uint64_t> lookupsUncached;
+	std::atomic<uint64_t> lookups;
+};
+
+#endif //_ATTRIBUTE_STORE_H

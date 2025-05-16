@@ -2,8 +2,16 @@
 #ifndef _HELPERS_H
 #define _HELPERS_H
 
-#include <zlib.h>
-#include "geom.h"
+#include <sstream>
+#include <vector>
+
+#define Z_DEFAULT_COMPRESSION -1
+
+#ifdef _MSVC_LANG
+#define ISATTY true
+#else
+#define ISATTY isatty(1)
+#endif
 
 // General helper routines
 
@@ -27,7 +35,18 @@ inline std::vector<std::string> split_string(std::string &inputStr, char sep) {
 	return res;
 }
 
-std::string decompress_string(const std::string& str, bool asGzip = false);
+struct OffsetAndLength {
+	uint64_t offset;
+	uint64_t length;
+};
+
+uint64_t getFileSize(std::string filename);
+std::vector<OffsetAndLength> getNewlineChunks(const std::string &filename, uint64_t chunks);
+
+void decompress_string(std::string& output, const char* input, uint32_t inputSize, bool asGzip = false);
+double bboxElementFromStr(const std::string& number);
+
+std::vector<std::string> parseBox(const std::string& bbox);
 
 std::string compress_string(const std::string& str,
                             int compressionlevel = Z_DEFAULT_COMPRESSION,
