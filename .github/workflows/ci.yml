@@ -719,7 +719,6 @@ jobs:
 
       - name: Build Docker image
         uses: docker/build-push-action@v7
-        uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
         if: ${{ github.ref != 'refs/heads/master'}}
         with:
           context: .
