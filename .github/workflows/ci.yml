@@ -767,9 +767,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=schedule,pattern=latest,type=branch
-            type=schedule,pattern={{date 'YYYY-MM-DDTHH_mm'}},type=branch
-            type=semver,type=pr
+            type=schedule,pattern=latest,event=branch
+            type=schedule,pattern={{date 'YYYY-MM-DDTHH_mm'}},event=branch
+            type=semver,event=pr
 
       - name: Read tilemaker version
         id: version
